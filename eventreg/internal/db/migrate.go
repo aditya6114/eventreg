@@ -31,7 +31,7 @@ import (
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
-// go:embed compiles the .sql files INTO the binary at build time. Without it
+// The embed directive below compiles the .sql files INTO the binary. Without it
 // the program would have to find migrations/ on disk at runtime — which breaks
 // the moment you ship a single binary in a Docker image (Week 2) or a
 // Kubernetes pod (Week 4). Embedding means the schema travels with the code.

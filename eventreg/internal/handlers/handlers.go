@@ -53,9 +53,15 @@ func (h *EventHandler) Register(e *echo.Echo, protect echo.MiddlewareFunc) {
 	// --- protected: extra middleware args apply to THIS route only ---
 	e.POST("/events", h.createEvent, protect)
 	e.POST("/events/:id/book", h.bookEvent, protect)
+	// Same resource, different verb: POST creates the booking, DELETE removes
+	// it. That's REST done properly — the URL names the THING, the method says
+	// what you're doing to it. (Not /events/:id/cancelBooking — verbs belong in
+	// the method, not the path.)
+	e.DELETE("/events/:id/book", h.cancelBooking, protect)
 	// "my bookings" — /me/* is the REST convention for "the current user",
 	// avoiding a user id in the URL that someone would inevitably tamper with.
 	e.GET("/me/bookings", h.myBookings, protect)
+	e.GET("/me/waitlist", h.myWaitlist, protect)
 }
 
 func (h *EventHandler) health(c echo.Context) error {
@@ -120,17 +126,62 @@ func (h *EventHandler) bookEvent(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnprocessableEntity, "seats must be > 0")
 	}
 
-	booking, err := h.Store.Book(id, userID, body.Seats)
+	res, err := h.Store.Book(id, userID, body.Seats)
 	if err != nil {
-		return err // 409 sold out / 404 not found, decided centrally
+		return err // 404 not found, decided centrally
 	}
 
-	// 201 for a new booking, 200 when we're replaying an existing one. The
-	// status itself tells an honest client whether anything changed.
-	if booking.Idempotent {
-		return c.JSON(http.StatusOK, booking)
+	// THE STATUS CODE CARRIES THE MEANING. Four outcomes, four honest answers:
+	//
+	//   201 Created  — a new booking exists
+	//   202 Accepted — request accepted, NOT yet fulfilled: you're queued.
+	//                  202 is exactly what it's for — "I took this, it's
+	//                  pending" — and far more truthful than a 200 that hides
+	//                  the fact you have no seat, or a 409 that implies
+	//                  failure when we did something useful for you.
+	//   200 OK       — you already had this booking/place; nothing changed
+	switch res.Outcome {
+	case models.OutcomeBooked:
+		return c.JSON(http.StatusCreated, res)
+	case models.OutcomeWaitlisted:
+		return c.JSON(http.StatusAccepted, res)
+	default: // already_booked / already_waitlisted — idempotent replays
+		return c.JSON(http.StatusOK, res)
 	}
-	return c.JSON(http.StatusCreated, booking)
+}
+
+// cancelBooking releases the user's seats and promotes from the waitlist.
+//
+// DELETE is the right verb: it removes a resource (this user's booking). The
+// promotion is a side effect the response reports, so the client can see that
+// their cancellation actually let someone else in.
+func (h *EventHandler) cancelBooking(c echo.Context) error {
+	id, err := intParam(c, "id")
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "id must be a number")
+	}
+	userID, ok := UserIDFrom(c)
+	if !ok {
+		return models.ErrUnauthorized
+	}
+	res, err := h.Store.CancelBooking(id, userID)
+	if err != nil {
+		return err // 404 if they had no booking
+	}
+	return c.JSON(http.StatusOK, res)
+}
+
+// myWaitlist shows what the user is queued for, and their position in each line.
+func (h *EventHandler) myWaitlist(c echo.Context) error {
+	userID, ok := UserIDFrom(c)
+	if !ok {
+		return models.ErrUnauthorized
+	}
+	list, err := h.Store.ListUserWaitlist(userID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, list)
 }
 
 // myBookings — the JOIN endpoint. Scoped to the authenticated user, so there's
