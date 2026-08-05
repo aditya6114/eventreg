@@ -22,7 +22,10 @@ import (
 // must allow for it. This is interfaces evolving to fit a real implementation
 // — a normal thing that happens once a concrete backend appears.
 type Store interface {
-	List() ([]models.Event, error)
+	// List is PAGINATED (lesson 13). An unbounded list endpoint is a
+	// production incident waiting to happen: it works fine with 10 events and
+	// falls over at 100,000.
+	List(limit, offset int) (models.Page[models.Event], error)
 	Get(id int) (models.Event, error)
 	Create(e models.Event) (models.Event, error)
 
@@ -82,15 +85,37 @@ func NewMemoryStore() Store {
 	}
 }
 
-func (s *memoryStore) List() ([]models.Event, error) {
+func (s *memoryStore) List(limit, offset int) (models.Page[models.Event], error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]models.Event, 0, len(s.events))
+	limit, offset = models.NormalizePagination(limit, offset)
+
+	all := make([]models.Event, 0, len(s.events))
 	for _, e := range s.events {
-		out = append(out, e)
+		all = append(all, e)
 	}
-	return out, nil // memory never fails, so error is always nil here
+	// Map iteration order in Go is RANDOMIZED by design, so we must sort to get
+	// the stable ordering pagination requires — the same reason the SQL version
+	// needs ORDER BY.
+	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
+
+	total := len(all)
+	// Slice bounds must be clamped: all[500:520] on a 3-element slice panics.
+	// The database silently returns nothing for an out-of-range OFFSET, so we
+	// match that behaviour here.
+	start := min(offset, total)
+	end := min(start+limit, total)
+	items := all[start:end]
+
+	return models.Page[models.Event]{
+		Items:   items,
+		Total:   total,
+		Limit:   limit,
+		Offset:  offset,
+		HasMore: start+len(items) < total,
+	}, nil
 }
+
 
 func (s *memoryStore) Get(id int) (models.Event, error) {
 	s.mu.Lock()

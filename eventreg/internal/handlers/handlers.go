@@ -7,6 +7,7 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/labstack/echo/v4"
 
@@ -68,12 +69,25 @@ func (h *EventHandler) health(c echo.Context) error {
 	return c.String(http.StatusOK, "ok")
 }
 
+// listEvents supports ?limit= and ?offset= — e.g. /events?limit=10&offset=20.
+//
+// Query params, not path params: they're OPTIONAL filters on a collection, not
+// part of the resource's identity. /events is the same resource whether you
+// asked for 10 of them or 100.
 func (h *EventHandler) listEvents(c echo.Context) error {
-	events, err := h.Store.List()
+	// Missing params come back as "" and parse to 0, which NormalizePagination
+	// turns into the defaults — so /events with no query string just works.
+	// We ignore parse errors deliberately: garbage like ?limit=abc falls back to
+	// the default rather than 400-ing. For a filter (as opposed to a required
+	// field) being forgiving is the friendlier choice.
+	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+	offset, _ := strconv.Atoi(c.QueryParam("offset"))
+
+	page, err := h.Store.List(limit, offset)
 	if err != nil {
 		return err // DB failure -> central handler -> 500 (no leak)
 	}
-	return c.JSON(http.StatusOK, events)
+	return c.JSON(http.StatusOK, page)
 }
 
 func (h *EventHandler) getEvent(c echo.Context) error {

@@ -96,28 +96,61 @@ func (s *postgresStore) Seed(ctx context.Context) error {
 	return nil
 }
 
-func (s *postgresStore) List() ([]models.Event, error) {
+func (s *postgresStore) List(limit, offset int) (models.Page[models.Event], error) {
 	ctx := context.Background()
-	// Query returns multiple rows. $-placeholders aren't needed here (no
-	// params), but ALWAYS use them for user input — string-concatenating SQL
-	// is how you get SQL injection. pgx sends params separately from the SQL.
-	rows, err := s.pool.Query(ctx, `SELECT id, name, seats FROM events ORDER BY id`)
+	limit, offset = models.NormalizePagination(limit, offset)
+
+	// TOTAL COUNT: a second query. Be aware this is not free — COUNT(*) on a
+	// large table scans an index (or worse, the table) every request. Options
+	// when it starts to hurt: cache it, use an approximate count from
+	// pg_class.reltuples, or drop the total entirely and use cursor pagination
+	// (see the explanation doc). We keep it because clients want "page 3 of 12".
+	var total int
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM events`).Scan(&total); err != nil {
+		return models.Page[models.Event]{}, err
+	}
+
+	// ORDER BY IS MANDATORY FOR PAGINATION, not decoration.
+	//
+	// Without an explicit, DETERMINISTIC ordering, Postgres may return rows in
+	// any order — and it can differ between queries. Then page 2 might repeat a
+	// row from page 1 and skip another entirely. `ORDER BY id` is total (ids are
+	// unique), so the sequence is stable across requests.
+	//
+	// If you order by a non-unique column (say name), always add a tiebreaker:
+	// ORDER BY name, id — otherwise rows with equal names can shuffle.
+	//
+	// LIMIT takes the page size, OFFSET skips rows. Both are parameterized —
+	// never interpolate them into the string.
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, name, seats FROM events ORDER BY id LIMIT $1 OFFSET $2`,
+		limit, offset)
 	if err != nil {
-		return nil, err
+		return models.Page[models.Event]{}, err
 	}
 	defer rows.Close() // lesson 4: defer the cleanup right after acquiring
 
-	out := make([]models.Event, 0)
+	items := make([]models.Event, 0, limit)
 	for rows.Next() { // advance one row at a time
 		var e models.Event
 		// Scan copies the row's columns INTO your struct fields, by position.
 		// Column order here must match the &pointers order.
 		if err := rows.Scan(&e.ID, &e.Name, &e.Seats); err != nil {
-			return nil, err
+			return models.Page[models.Event]{}, err
 		}
-		out = append(out, e)
+		items = append(items, e)
 	}
-	return out, rows.Err() // check for an error that ended the iteration
+	if err := rows.Err(); err != nil { // an error that ended the iteration
+		return models.Page[models.Event]{}, err
+	}
+
+	return models.Page[models.Event]{
+		Items:   items,
+		Total:   total,
+		Limit:   limit,
+		Offset:  offset,
+		HasMore: offset+len(items) < total,
+	}, nil
 }
 
 func (s *postgresStore) Get(id int) (models.Event, error) {
