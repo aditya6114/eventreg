@@ -30,14 +30,32 @@ func New(s storage.Store) *EventHandler {
 // Register wires all routes and the central error handler onto an Echo
 // instance. Keeping routing next to the handlers (not in main) means main
 // stays a thin wiring file.
-func (h *EventHandler) Register(e *echo.Echo) {
+// Register wires the event routes. `protect` is the auth middleware; passing it
+// in (rather than importing AuthHandler here) keeps this package unaware of how
+// authentication works — it only knows "wrap this route in that".
+//
+// PUBLIC vs PROTECTED is a deliberate product decision, not an accident:
+//   - browsing events is public (you must see what's on offer before signing up)
+//   - BOOKING requires a login, because a booking belongs to a person
+func (h *EventHandler) Register(e *echo.Echo, protect echo.MiddlewareFunc) {
 	e.HTTPErrorHandler = errorHandler // central mapping, defined below
 
+	// --- public ---
 	e.GET("/health", h.health)
 	e.GET("/events", h.listEvents)
+	// NOTE: /events/stats must be registered BEFORE /events/:id would be a
+	// concern in some routers, because "stats" could match the :id pattern.
+	// Echo prioritises static segments over params, so this is safe — but it's
+	// a real trap in routers that match in declaration order.
+	e.GET("/events/stats", h.eventStats)
 	e.GET("/events/:id", h.getEvent)
-	e.POST("/events", h.createEvent)
-	e.POST("/events/:id/book", h.bookEvent)
+
+	// --- protected: extra middleware args apply to THIS route only ---
+	e.POST("/events", h.createEvent, protect)
+	e.POST("/events/:id/book", h.bookEvent, protect)
+	// "my bookings" — /me/* is the REST convention for "the current user",
+	// avoiding a user id in the URL that someone would inevitably tamper with.
+	e.GET("/me/bookings", h.myBookings, protect)
 }
 
 func (h *EventHandler) health(c echo.Context) error {
@@ -84,17 +102,58 @@ func (h *EventHandler) bookEvent(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "id must be a number")
 	}
+	// WHO is booking comes from the VERIFIED JWT (set by RequireAuth), never
+	// from the request body. If the client could send its own user_id, anyone
+	// could book on anyone else's behalf — a textbook broken-access-control bug.
+	userID, ok := UserIDFrom(c)
+	if !ok {
+		return models.ErrUnauthorized
+	}
+
 	var body struct {
 		Seats int `json:"seats"`
 	}
 	if err := c.Bind(&body); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid JSON body")
 	}
-	booked, err := h.Store.Book(id, body.Seats)
-	if err != nil {
-		return err // 409 or 404, decided centrally
+	if body.Seats <= 0 {
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, "seats must be > 0")
 	}
-	return c.JSON(http.StatusOK, booked)
+
+	booking, err := h.Store.Book(id, userID, body.Seats)
+	if err != nil {
+		return err // 409 sold out / 404 not found, decided centrally
+	}
+
+	// 201 for a new booking, 200 when we're replaying an existing one. The
+	// status itself tells an honest client whether anything changed.
+	if booking.Idempotent {
+		return c.JSON(http.StatusOK, booking)
+	}
+	return c.JSON(http.StatusCreated, booking)
+}
+
+// myBookings — the JOIN endpoint. Scoped to the authenticated user, so there's
+// no way to read someone else's bookings by changing a URL parameter.
+func (h *EventHandler) myBookings(c echo.Context) error {
+	userID, ok := UserIDFrom(c)
+	if !ok {
+		return models.ErrUnauthorized
+	}
+	list, err := h.Store.ListUserBookings(userID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, list)
+}
+
+// eventStats — the GROUP BY endpoint: how each event is selling.
+func (h *EventHandler) eventStats(c echo.Context) error {
+	stats, err := h.Store.EventStats()
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, stats)
 }
 
 // errorHandler maps domain errors -> HTTP responses in ONE place (lesson 6).
@@ -106,6 +165,14 @@ func errorHandler(err error, c echo.Context) {
 	}
 	status := http.StatusInternalServerError
 	msg := "internal server error"
+
+	// Auth errors first (lesson 10): 401 for bad/missing credentials,
+	// 409 for a duplicate email. Kept in auth.go next to the code that
+	// produces them, so the mapping lives beside its reasoning.
+	if s, m, handled := authStatus(err); handled {
+		_ = c.JSON(s, map[string]string{"error": m})
+		return
+	}
 
 	var nf *models.NotFoundError
 	switch {
