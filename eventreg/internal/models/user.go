@@ -17,6 +17,7 @@ import (
 // Note we store the HASH, never the password. The system is designed so that
 // nobody — including us, including anyone who steals a database dump — can read
 // a user's password.
+
 type User struct {
 	ID           int       `json:"id"`
 	Email        string    `json:"email"`

@@ -1,119 +1,254 @@
-// Command api is the entry point for the Event Ticketing service.
+// Command api is the entry point for the Event Registration service.
 //
-// This is the ONLY package main in the real project. Convention: runnable
-// programs live under cmd/<name>/, so a repo can ship several binaries
-// (cmd/api, later maybe cmd/migrate, cmd/notifier) that all share the
-// internal/ libraries.
+// This is the ONLY package main in the project (besides cmd/loadtest).
+// Convention: runnable programs live under cmd/<name>/, so a repo can ship
+// several binaries that all share the internal/ libraries.
 //
-// main() is a "composition root": it CONSTRUCTS the concrete pieces and
-// WIRES them together, then starts the server. It contains almost no logic
-// of its own — logic lives in the internal packages. Read this file to
-// understand how the app is assembled; read internal/* to understand what
-// it does.
+// main() is a "composition root": it CONSTRUCTS the concrete pieces, WIRES
+// them together, runs the server, and shuts it down cleanly. It contains
+// almost no logic of its own — logic lives in the internal packages.
 //
 // Run it from the eventreg folder:
-//   go run ./cmd/api
+//
+//	go run ./cmd/api
+//
+// Configuration is entirely environment-driven (internal/config). PowerShell:
+//
+//	$env:DATABASE_URL="postgres://eventgo:secret@localhost:5432/eventgo"
+//	$env:JWT_SECRET="a-long-random-string-at-least-32-chars-ok"
+//	$env:LOG_FORMAT="json"     # or "text" (default in dev)
+//	$env:PORT="8082"
 //
 // Then — GETs are simple everywhere:
-//   curl localhost:8082/health
-//   curl localhost:8082/events
-//   curl localhost:8082/events/1
+//
+//	curl localhost:8082/health
+//	curl "localhost:8082/events?limit=10&offset=0"
 //
 // JSON POSTs need the Content-Type header (Echo's c.Bind dispatches on it —
 // lesson 6 gotcha). The body syntax differs by shell:
 //
-//   bash / cmd.exe:
-//     curl -H "Content-Type: application/json" -X POST localhost:8082/events/1/book -d "{\"seats\":5}"
+//	bash / cmd.exe:
+//	  curl -H "Content-Type: application/json" -X POST localhost:8082/events/1/book -d "{\"seats\":5}"
 //
-//   PowerShell 5.1 — the above FAILS. PowerShell strips embedded quotes when
-//   passing args to a native .exe, so curl receives broken JSON and the API
-//   correctly answers 400. Use either:
-//     Invoke-RestMethod -Uri http://localhost:8082/events/1/book -Method Post `
-//       -ContentType "application/json" -Body '{"seats":5}'
-//   ...or curl with the --% stop-parsing token (needed to see 4xx bodies,
-//   since Invoke-RestMethod throws on 4xx/5xx instead of printing them):
-//     curl.exe --% -H "Content-Type: application/json" -X POST localhost:8082/events/1/book -d "{\"seats\":5}"
+//	PowerShell 5.1 — the above FAILS. PowerShell strips embedded quotes when
+//	passing args to a native .exe, so curl receives broken JSON and the API
+//	correctly answers 400. Use either:
+//	  Invoke-RestMethod -Uri http://localhost:8082/events/1/book -Method Post `
+//	    -ContentType "application/json" -Body '{"seats":5}'
+//	...or curl with the --% stop-parsing token (needed to see 4xx bodies,
+//	since Invoke-RestMethod throws on 4xx/5xx instead of printing them):
+//	  curl.exe --% -H "Content-Type: application/json" -X POST localhost:8082/events/1/book -d "{\"seats\":5}"
 package main
 
 import (
-	"log"
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
 	"os"
-	"time"
+	"os/signal"
+	"syscall"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 
+	"eventreg/internal/config"
 	"eventreg/internal/db"
 	"eventreg/internal/handlers"
+	"eventreg/internal/logging"
 	"eventreg/internal/storage"
 )
 
 func main() {
-	// 1. Build the storage layer. THIS is the payoff of the interface: the
-	//    choice of backend lives here and NOWHERE else. If DATABASE_URL is
-	//    set we use Postgres; otherwise we fall back to the in-memory store.
-	//    Both return a storage.Store, so `h` below can't tell them apart.
-	//    Set it (PowerShell) with:
-	//      $env:DATABASE_URL="postgres://eventgo:secret@localhost:5432/eventgo"
-	var store storage.Store
-	var users storage.UserStore
-	if url := os.Getenv("DATABASE_URL"); url != "" {
-		// Run migrations BEFORE building the stores. The app should never talk
-		// to a database whose schema it hasn't verified — starting up against
-		// an out-of-date schema produces confusing runtime errors instead of
-		// one clear failure here. Migrations are idempotent, so this is safe
-		// on every restart: already-applied versions are skipped.
-		if err := db.Migrate(url); err != nil {
-			log.Fatal("migrate: ", err)
+	// run() exists so we can use defer AND control the exit code. os.Exit
+	// skips deferred functions entirely, so calling it inside main would mean
+	// our cleanup never runs. Keeping main tiny and putting the real work in a
+	// function that returns an error is the standard Go shape for this.
+	if err := run(); err != nil {
+		slog.Error("fatal", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	// ---- 1. CONFIG ------------------------------------------------------
+	// Everything the program can be tuned with, read once, validated once.
+	// If anything is wrong we return here — before a port is bound, before a
+	// database connection exists, before a single request is accepted.
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	// ---- 2. LOGGING -----------------------------------------------------
+	// Set this up SECOND, immediately after config, so everything from here on
+	// is logged consistently. (Config can't use it — it runs before the logger
+	// exists, which is why config returns errors instead of logging them.)
+	logger := logging.New(cfg.LogLevel, cfg.LogFormat)
+	logger.Info("starting",
+		"env", cfg.Env,
+		"port", cfg.Port,
+		"log_level", cfg.LogLevel.String(),
+	)
+	if cfg.UsesInsecureDevSecret() {
+		logger.Warn("JWT_SECRET not set — using the insecure development secret; never do this in production")
+	}
+
+	// ---- 3. STORAGE -----------------------------------------------------
+	// The interface payoff: the backend choice lives here and NOWHERE else.
+	var (
+		store storage.Store
+		users storage.UserStore
+		pool  *pgxpool.Pool // nil when running in-memory
+	)
+
+	if cfg.DatabaseURL != "" {
+		// Migrations BEFORE the stores. The app should never talk to a database
+		// whose schema it hasn't verified — an out-of-date schema produces
+		// confusing runtime errors instead of one clear failure here.
+		// Migrations are idempotent, so this is safe on every restart.
+		if err := db.Migrate(cfg.DatabaseURL); err != nil {
+			return err
 		}
-		if v, dirty, err := db.Version(url); err == nil {
-			log.Printf("schema: version %d (dirty=%t)", v, dirty)
+		if v, dirty, err := db.Version(cfg.DatabaseURL); err == nil {
+			logger.Info("schema ready", "version", v, "dirty", dirty)
 		}
 
 		// ONE pool, shared by both stores. See storage.NewPool for why.
-		pool, err := storage.NewPool(url)
+		pool, err = storage.NewPool(cfg.DatabaseURL)
 		if err != nil {
-			log.Fatal("postgres: ", err) // can't start without the DB it was told to use
+			return err
 		}
-		defer pool.Close() // released on shutdown
+		// Closed AFTER the server drains, at the bottom of this function —
+		// not via defer here, because ORDER MATTERS: closing the pool while
+		// requests are still finishing would fail those requests. See the
+		// shutdown sequence below.
 
 		s, err := storage.NewPostgresStore(pool)
 		if err != nil {
-			log.Fatal("postgres: ", err)
+			pool.Close()
+			return err
 		}
 		store = s
 		users = storage.NewPostgresUserStore(pool)
-		log.Println("storage: postgres")
+		logger.Info("storage ready", "backend", "postgres")
 	} else {
 		store = storage.NewMemoryStore()
 		users = storage.NewMemoryUserStore()
-		log.Println("storage: in-memory (set DATABASE_URL to use postgres)")
+		logger.Warn("storage ready", "backend", "in-memory",
+			"note", "data is lost on restart; set DATABASE_URL to use postgres")
 	}
 
-	// 2. Auth config. The JWT secret MUST come from the environment — a secret
-	//    hard-coded in source is in your git history forever, and anyone who
-	//    reads the repo can mint valid tokens for any user. The dev fallback
-	//    below is a convenience that loudly warns; production must set it.
-	secret := []byte(os.Getenv("JWT_SECRET"))
-	if len(secret) == 0 {
-		secret = []byte("dev-only-insecure-secret-change-me")
-		log.Println("WARNING: JWT_SECRET not set — using an insecure dev secret")
-	}
-
-	// 3. Build the HTTP layer, injecting the dependencies each part needs.
+	// ---- 4. HTTP LAYER --------------------------------------------------
 	h := handlers.New(store)
-	authH := handlers.NewAuth(users, secret, 24*time.Hour)
+	authH := handlers.NewAuth(users, cfg.JWTSecret, cfg.TokenTTL)
 
-	// 4. Build the Echo app + cross-cutting middleware.
 	e := echo.New()
-	e.Use(middleware.Logger())
+	e.HideBanner = true // the ASCII art is noise in structured logs
+	e.HidePort = true   // we log the port ourselves, as a field
+	e.Use(logging.RequestLogger(logger))
 	e.Use(middleware.Recover())
 
-	// 5. Register routes. Auth registers its own; the event handler is handed
-	//    the auth middleware so it can protect the routes that need a user.
 	authH.Register(e)
 	h.Register(e, authH.RequireAuth)
 
-	// 6. Start serving (blocks).
-	e.Logger.Fatal(e.Start(":8082"))
+	// ---- 5. START SERVING (in the background) ---------------------------
+	//
+	// e.Start BLOCKS, so it goes in a goroutine — otherwise we'd never reach
+	// the signal-waiting code below.
+	//
+	// Errors come back on a channel rather than being logged inside the
+	// goroutine, so the main flow can react to them (a failed bind should exit,
+	// not leave us waiting for a signal that will never come).
+	serverErr := make(chan error, 1) // buffered: the sender never blocks
+	go func() {
+		logger.Info("listening", "addr", ":"+cfg.Port)
+		err := e.Start(":" + cfg.Port)
+		// Shutdown() causes Start() to return ErrServerClosed. That's the
+		// EXPECTED path, not a failure — filter it out or we'd report a
+		// successful shutdown as an error.
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	// ---- 6. WAIT FOR A SIGNAL (graceful shutdown) -----------------------
+	//
+	// WHY THIS MATTERS (interview item): when Docker runs `docker stop`, or
+	// Kubernetes evicts a pod during a rolling update, the runtime sends
+	// SIGTERM and then waits a grace period before SIGKILL. Without handling
+	// it, the process dies INSTANTLY — mid-request, mid-transaction. A user
+	// booking a seat gets a dropped connection and never learns whether their
+	// booking succeeded. In a rolling update that happens to every in-flight
+	// request on every pod, every deploy.
+	//
+	// signal.NotifyContext gives us a context that is CANCELLED when one of
+	// these signals arrives — which turns "wait for a signal" into the same
+	// <-ctx.Done() pattern used everywhere else in Go.
+	//   SIGTERM = "please stop"  (Docker, Kubernetes, systemd)
+	//   SIGINT  = Ctrl+C         (you, at a terminal)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	select {
+	case err := <-serverErr:
+		// The server died on its own (port already in use, for example).
+		if err != nil {
+			if pool != nil {
+				pool.Close()
+			}
+			return err
+		}
+	case <-ctx.Done():
+		// A signal arrived. Begin the orderly shutdown below.
+		logger.Info("shutdown signal received", "timeout", cfg.ShutdownTimeout.String())
+	}
+
+	// stop() restores the DEFAULT signal behaviour, so a SECOND Ctrl+C kills
+	// the process immediately. Without it, an operator who sees a hung
+	// shutdown has no way to force it short of SIGKILL from another terminal.
+	stop()
+
+	// ---- 7. DRAIN --------------------------------------------------------
+	//
+	// e.Shutdown:
+	//   1. stops accepting NEW connections
+	//   2. waits for in-flight requests to finish
+	//   3. returns when they're done, OR when this context expires
+	//
+	// THE TIMEOUT IS ESSENTIAL. Without a deadline, one slow request (or a
+	// hung one) would block shutdown forever, and the orchestrator's SIGKILL
+	// would eventually kill us anyway — losing the very requests we were
+	// trying to protect. The timeout must be SHORTER than the platform's grace
+	// period (Kubernetes defaults to 30s), so we finish on our own terms.
+	//
+	// This is context.WithTimeout doing the job I described earlier: a deadline
+	// that propagates a "stop waiting" signal down a call chain.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel() // always release the timer
+
+	if err := e.Shutdown(shutdownCtx); err != nil {
+		// Deadline hit: some requests were still running and are now cut off.
+		// Worth logging loudly — it usually means a request is too slow or a
+		// handler is stuck.
+		logger.Error("graceful shutdown timed out; forcing close", "error", err)
+	} else {
+		logger.Info("all in-flight requests completed")
+	}
+
+	// ---- 8. RELEASE RESOURCES -------------------------------------------
+	//
+	// ORDER MATTERS, and it's the reverse of startup: the database closes AFTER
+	// the HTTP server has drained. Closing it first would break the very
+	// requests we just waited for.
+	if pool != nil {
+		pool.Close()
+		logger.Info("database pool closed")
+	}
+
+	logger.Info("shutdown complete")
+	return nil
 }

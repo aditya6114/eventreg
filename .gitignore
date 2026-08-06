@@ -1,0 +1,44 @@
+# --- Personal learning / study material (not part of the project) ---
+go-basics/
+explanations/
+STUDY-CHECKLIST.md
+
+# --- Go build artifacts ---
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+dist/
+vendor/
+
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Logs & temp files ---
+*.log
+logs/
+tmp/
+*.tmp
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Claude Code local settings ---
+.claude/settings.local.json
