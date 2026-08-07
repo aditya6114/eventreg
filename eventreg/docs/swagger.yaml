@@ -1,0 +1,567 @@
+basePath: /
+definitions:
+  handlers.BookRequest:
+    properties:
+      seats:
+        example: 2
+        type: integer
+    type: object
+  handlers.Credentials:
+    properties:
+      email:
+        type: string
+      password:
+        type: string
+    type: object
+  handlers.ErrorResponse:
+    properties:
+      error:
+        example: event not found
+        type: string
+    type: object
+  handlers.TokenResponse:
+    properties:
+      token:
+        type: string
+      user:
+        $ref: '#/definitions/models.User'
+    type: object
+  models.Booking:
+    properties:
+      created_at:
+        type: string
+      event_id:
+        type: integer
+      id:
+        type: integer
+      idempotent:
+        description: |-
+          Idempotent tells the caller "this booking already existed; your request
+          was a duplicate and changed nothing." Not persisted — it's a property of
+          THIS response, not of the row. Lets the handler answer 200 (here it is
+          again) instead of 201 (something new was made).
+        type: boolean
+      seats:
+        type: integer
+      user_id:
+        type: integer
+    type: object
+  models.BookingResult:
+    properties:
+      booking:
+        $ref: '#/definitions/models.Booking'
+      outcome:
+        type: string
+      waitlist:
+        $ref: '#/definitions/models.WaitlistEntry'
+    type: object
+  models.BookingWithEvent:
+    properties:
+      created_at:
+        type: string
+      event_id:
+        type: integer
+      event_name:
+        type: string
+      event_seats_left:
+        type: integer
+      id:
+        type: integer
+      idempotent:
+        description: |-
+          Idempotent tells the caller "this booking already existed; your request
+          was a duplicate and changed nothing." Not persisted — it's a property of
+          THIS response, not of the row. Lets the handler answer 200 (here it is
+          again) instead of 201 (something new was made).
+        type: boolean
+      seats:
+        type: integer
+      user_id:
+        type: integer
+    type: object
+  models.CancelResult:
+    properties:
+      event_id:
+        type: integer
+      promoted:
+        description: waitlisted users who just got in
+        items:
+          $ref: '#/definitions/models.Booking'
+        type: array
+      seats_freed:
+        type: integer
+      seats_left:
+        type: integer
+    type: object
+  models.Event:
+    properties:
+      id:
+        type: integer
+      name:
+        type: string
+      seats:
+        type: integer
+    type: object
+  models.EventPage:
+    properties:
+      has_more:
+        description: |-
+          HasMore saves the client doing offset+limit < total arithmetic, and lets
+          us change the underlying strategy (e.g. to cursors) without breaking them.
+        type: boolean
+      items:
+        items:
+          $ref: '#/definitions/models.Event'
+        type: array
+      limit:
+        description: page size actually applied (may be clamped)
+        type: integer
+      offset:
+        description: rows skipped
+        type: integer
+      total:
+        description: total matching rows, ignoring limit/offset
+        type: integer
+    type: object
+  models.EventStat:
+    properties:
+      booking_count:
+        description: COUNT(*) — how many bookings
+        type: integer
+      event_id:
+        type: integer
+      name:
+        type: string
+      seats_booked:
+        description: SUM(seats) — how many seats sold
+        type: integer
+      seats_left:
+        type: integer
+    type: object
+  models.User:
+    properties:
+      created_at:
+        type: string
+      email:
+        type: string
+      id:
+        type: integer
+    type: object
+  models.WaitlistEntry:
+    properties:
+      created_at:
+        type: string
+      event_id:
+        type: integer
+      id:
+        type: integer
+      position:
+        description: |-
+          Position is COMPUTED at read time (1-based), never stored. Storing a
+          position column would mean renumbering every row behind someone who
+          leaves the queue — an expensive write amplification and a fresh source
+          of races. created_at already encodes the order, so we derive position
+          from it instead. Prefer deriving over duplicating.
+        type: integer
+      seats:
+        type: integer
+      user_id:
+        type: integer
+    type: object
+  models.WaitlistEntryWithEvent:
+    properties:
+      created_at:
+        type: string
+      event_id:
+        type: integer
+      event_name:
+        type: string
+      id:
+        type: integer
+      position:
+        description: |-
+          Position is COMPUTED at read time (1-based), never stored. Storing a
+          position column would mean renumbering every row behind someone who
+          leaves the queue — an expensive write amplification and a fresh source
+          of races. created_at already encodes the order, so we derive position
+          from it instead. Prefer deriving over duplicating.
+        type: integer
+      seats:
+        type: integer
+      user_id:
+        type: integer
+    type: object
+host: localhost:8082
+info:
+  contact:
+    name: Aditya Choudhary
+  description: |-
+    Launch-proof event registration. Handles the "everyone hits register at once"
+    stampede: never double-books a seat, auto-waitlists when full, and promotes
+    from the queue when someone cancels.
+
+    Auth: call /auth/register or /auth/login to get a JWT, then click
+    **Authorize** above and paste `Bearer <token>`.
+  title: Event Registration API
+  version: "1.0"
+paths:
+  /auth/login:
+    post:
+      consumes:
+      - application/json
+      description: |-
+        Returns 200 (not 201) — logging in creates no resource.
+
+        An unknown email and a wrong password return the SAME 401 with the SAME
+        message, deliberately: distinguishing them would let an attacker enumerate
+        which addresses have accounts.
+      parameters:
+      - description: email and password
+        in: body
+        name: credentials
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.Credentials'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.TokenResponse'
+        "400":
+          description: malformed JSON
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "401":
+          description: invalid email or password
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      summary: Log in and get a JWT
+      tags:
+      - auth
+  /auth/me:
+    get:
+      description: |-
+        Requires authentication. Returns the account belonging to the token —
+        the simplest proof that the auth middleware is working.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/models.User'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Who am I
+      tags:
+      - auth
+  /auth/register:
+    post:
+      consumes:
+      - application/json
+      description: |-
+        Creates the user and returns a JWT immediately, so a fresh signup does not
+        have to log in with the credentials it just typed.
+        Passwords are stored as bcrypt hashes and are never returned.
+      parameters:
+      - description: email and password (min 8 chars)
+        in: body
+        name: credentials
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.Credentials'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/handlers.TokenResponse'
+        "400":
+          description: malformed JSON
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "409":
+          description: email already registered
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "422":
+          description: invalid email or password too short
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      summary: Register a new account
+      tags:
+      - auth
+  /events:
+    get:
+      description: |-
+        Public. Returns a page envelope: {items, total, limit, offset, has_more}.
+        `limit` defaults to 20 and is clamped to a maximum of 100.
+      parameters:
+      - description: page size (default 20, max 100)
+        in: query
+        name: limit
+        type: integer
+      - description: rows to skip (default 0)
+        in: query
+        name: offset
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/models.EventPage'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      summary: List events (paginated)
+      tags:
+      - events
+    post:
+      consumes:
+      - application/json
+      description: Requires authentication. `id` in the body is ignored — the database
+        assigns it.
+      parameters:
+      - description: name and seats
+        in: body
+        name: event
+        required: true
+        schema:
+          $ref: '#/definitions/models.Event'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/models.Event'
+        "400":
+          description: malformed JSON
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "401":
+          description: missing or invalid token
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "422":
+          description: name empty or seats <= 0
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Create an event
+      tags:
+      - events
+  /events/{id}:
+    get:
+      parameters:
+      - description: event id
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/models.Event'
+        "400":
+          description: id is not a number
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "404":
+          description: no such event
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      summary: Get one event
+      tags:
+      - events
+  /events/{id}/book:
+    delete:
+      description: |-
+        Requires authentication. Frees your seats and immediately promotes the
+        longest-waiting users who fit — all in one transaction, so the freed seats
+        cannot be taken by a new arrival before the queue gets them.
+        The response lists who was promoted.
+      parameters:
+      - description: event id
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/models.CancelResult'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "404":
+          description: you have no booking for this event
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Cancel a booking (promotes from the waitlist)
+      tags:
+      - bookings
+    post:
+      consumes:
+      - application/json
+      description: |-
+        Requires authentication. The booking is attributed to the token's user.
+
+        **Idempotent**: repeating the same request returns the original booking
+        with `outcome: already_booked` and does not consume more seats.
+
+        Status codes carry the outcome:
+        - **201** `booked` — a new booking exists
+        - **202** `waitlisted` — event was full, you were queued
+        - **200** `already_booked` / `already_waitlisted` — replay, nothing changed
+      parameters:
+      - description: event id
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: seats to book
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.BookRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: idempotent replay
+          schema:
+            $ref: '#/definitions/models.BookingResult'
+        "201":
+          description: booked
+          schema:
+            $ref: '#/definitions/models.BookingResult'
+        "202":
+          description: waitlisted
+          schema:
+            $ref: '#/definitions/models.BookingResult'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "404":
+          description: no such event
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "422":
+          description: seats <= 0
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Book seats (auto-waitlists if full)
+      tags:
+      - bookings
+  /events/stats:
+    get:
+      description: |-
+        Public. Booking count and seats sold per event, via GROUP BY with a
+        LEFT JOIN — so events with zero bookings still appear.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/models.EventStat'
+            type: array
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      summary: Per-event sales stats
+      tags:
+      - events
+  /health:
+    get:
+      description: Returns "ok" if the process is up. Used by Docker/Kubernetes probes.
+      produces:
+      - text/plain
+      responses:
+        "200":
+          description: ok
+          schema:
+            type: string
+      summary: Liveness check
+      tags:
+      - meta
+  /me/bookings:
+    get:
+      description: |-
+        Requires authentication. Scoped to the token's user — there is no id in the
+        URL to tamper with, so you cannot read anyone else's bookings.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/models.BookingWithEvent'
+            type: array
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: My bookings
+      tags:
+      - me
+  /me/waitlist:
+    get:
+      description: |-
+        Requires authentication. `position` is 1-based and computed at read time
+        from arrival order — it is not stored, so it is never stale.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/models.WaitlistEntryWithEvent'
+            type: array
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: My waitlist entries (with queue position)
+      tags:
+      - me
+securityDefinitions:
+  BearerAuth:
+    description: 'JWT from /auth/login. Format: "Bearer {token}"'
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"

@@ -1,0 +1,48 @@
+# .dockerignore — what NOT to send to the Docker daemon.
+#
+# When you run `docker build .`, the CLI packages up the "build context" (that
+# `.` — this whole directory) and ships it to the daemon BEFORE any instruction
+# runs. Everything listed here is excluded from that package.
+#
+# Three reasons it matters:
+#
+#  1. SPEED. A context with .git and stray binaries can be hundreds of MB, and
+#     it's transferred on every single build.
+#  2. CACHE CORRECTNESS. `COPY . .` invalidates its layer whenever ANY file in
+#     the context changes. Without this file, editing a README would bust the
+#     cache and trigger a full recompile.
+#  3. SECRETS. Anything copied into an image is IN the image — recoverable by
+#     anyone who pulls it, even if a later layer deletes it. A .env that sneaks
+#     in is a leaked credential.
+
+# Version control — large, and never needed to compile
+.git
+.gitignore
+
+# Local secrets — must never enter an image
+.env
+.env.*
+*.pem
+*.key
+
+# Build artifacts (we compile INSIDE the image; host binaries are the wrong
+# OS/arch anyway and would just bloat the context)
+*.exe
+*.out
+api
+loadtest
+
+# Docs and editor noise
+*.md
+.vscode
+.idea
+
+# Docker's own files — not needed inside the build
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# NOTE what is deliberately NOT ignored:
+#   docs/     — the generated Swagger package is imported by cmd/api, so the
+#               build FAILS without it. Easy mistake to make.
+#   go.sum    — required for reproducible, verified dependency downloads.

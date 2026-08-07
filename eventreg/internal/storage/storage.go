@@ -34,6 +34,7 @@ type Store interface {
 	//
 	// Lesson 12: it returns a BookingResult because a full event no longer
 	// means failure — the user is auto-enqueued on the waitlist instead.
+	
 	Book(eventID, userID, seats int) (models.BookingResult, error)
 
 	// CancelBooking releases a booking's seats AND promotes whoever has been

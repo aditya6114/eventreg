@@ -15,6 +15,26 @@ import (
 	"eventreg/internal/storage"
 )
 
+// ErrorResponse is the ONE shape every error in this API takes.
+//
+// It replaces the anonymous map[string]string we were building inline. Two
+// reasons that's an upgrade: OpenAPI can only document a NAMED type (a map
+// would appear as an opaque object), and a declared struct makes the error
+// contract greppable and impossible to typo — `{"eror": ...}` was previously
+// a one-character bug away.
+type ErrorResponse struct {
+	Error string `json:"error" example:"event not found"`
+}
+
+// BookRequest is the body of POST /events/{id}/book.
+//
+// Note what is NOT here: no user_id. Identity comes from the verified JWT, so
+// there is nothing for a client to forge. The request body should only carry
+// what the client is genuinely entitled to decide.
+type BookRequest struct {
+	Seats int `json:"seats" example:"2"`
+}
+
 // EventHandler bundles the dependencies its methods need. Here that's just
 // the store. This is DEPENDENCY INJECTION: main() creates the store and
 // hands it in, rather than handlers reaching for a global. It's what makes
@@ -65,6 +85,14 @@ func (h *EventHandler) Register(e *echo.Echo, protect echo.MiddlewareFunc) {
 	e.GET("/me/waitlist", h.myWaitlist, protect)
 }
 
+// health godoc
+//
+//	@Summary		Liveness check
+//	@Description	Returns "ok" if the process is up. Used by Docker/Kubernetes probes.
+//	@Tags			meta
+//	@Produce		plain
+//	@Success		200	{string}	string	"ok"
+//	@Router			/health [get]
 func (h *EventHandler) health(c echo.Context) error {
 	return c.String(http.StatusOK, "ok")
 }
@@ -74,6 +102,17 @@ func (h *EventHandler) health(c echo.Context) error {
 // Query params, not path params: they're OPTIONAL filters on a collection, not
 // part of the resource's identity. /events is the same resource whether you
 // asked for 10 of them or 100.
+//
+//	@Summary		List events (paginated)
+//	@Description	Public. Returns a page envelope: {items, total, limit, offset, has_more}.
+//	@Description	`limit` defaults to 20 and is clamped to a maximum of 100.
+//	@Tags			events
+//	@Produce		json
+//	@Param			limit	query		int	false	"page size (default 20, max 100)"
+//	@Param			offset	query		int	false	"rows to skip (default 0)"
+//	@Success		200		{object}	models.EventPage
+//	@Failure		500		{object}	handlers.ErrorResponse
+//	@Router			/events [get]
 func (h *EventHandler) listEvents(c echo.Context) error {
 	// Missing params come back as "" and parse to 0, which NormalizePagination
 	// turns into the defaults — so /events with no query string just works.
@@ -90,6 +129,14 @@ func (h *EventHandler) listEvents(c echo.Context) error {
 	return c.JSON(http.StatusOK, page)
 }
 
+//	@Summary		Get one event
+//	@Tags			events
+//	@Produce		json
+//	@Param			id	path		int	true	"event id"
+//	@Success		200	{object}	models.Event
+//	@Failure		400	{object}	handlers.ErrorResponse	"id is not a number"
+//	@Failure		404	{object}	handlers.ErrorResponse	"no such event"
+//	@Router			/events/{id} [get]
 func (h *EventHandler) getEvent(c echo.Context) error {
 	id, err := intParam(c, "id")
 	if err != nil {
@@ -102,6 +149,18 @@ func (h *EventHandler) getEvent(c echo.Context) error {
 	return c.JSON(http.StatusOK, e)
 }
 
+//	@Summary		Create an event
+//	@Description	Requires authentication. `id` in the body is ignored — the database assigns it.
+//	@Tags			events
+//	@Accept			json
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			event	body		models.Event	true	"name and seats"
+//	@Success		201		{object}	models.Event
+//	@Failure		400		{object}	handlers.ErrorResponse	"malformed JSON"
+//	@Failure		401		{object}	handlers.ErrorResponse	"missing or invalid token"
+//	@Failure		422		{object}	handlers.ErrorResponse	"name empty or seats <= 0"
+//	@Router			/events [post]
 func (h *EventHandler) createEvent(c echo.Context) error {
 	var in models.Event
 	if err := c.Bind(&in); err != nil {
@@ -117,6 +176,29 @@ func (h *EventHandler) createEvent(c echo.Context) error {
 	return c.JSON(http.StatusCreated, created)
 }
 
+//	@Summary		Book seats (auto-waitlists if full)
+//	@Description	Requires authentication. The booking is attributed to the token's user.
+//	@Description
+//	@Description	**Idempotent**: repeating the same request returns the original booking
+//	@Description	with `outcome: already_booked` and does not consume more seats.
+//	@Description
+//	@Description	Status codes carry the outcome:
+//	@Description	- **201** `booked` — a new booking exists
+//	@Description	- **202** `waitlisted` — event was full, you were queued
+//	@Description	- **200** `already_booked` / `already_waitlisted` — replay, nothing changed
+//	@Tags			bookings
+//	@Accept			json
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			id		path		int						true	"event id"
+//	@Param			body	body		handlers.BookRequest	true	"seats to book"
+//	@Success		201		{object}	models.BookingResult	"booked"
+//	@Success		202		{object}	models.BookingResult	"waitlisted"
+//	@Success		200		{object}	models.BookingResult	"idempotent replay"
+//	@Failure		401		{object}	handlers.ErrorResponse
+//	@Failure		404		{object}	handlers.ErrorResponse	"no such event"
+//	@Failure		422		{object}	handlers.ErrorResponse	"seats <= 0"
+//	@Router			/events/{id}/book [post]
 func (h *EventHandler) bookEvent(c echo.Context) error {
 	id, err := intParam(c, "id")
 	if err != nil {
@@ -130,9 +212,9 @@ func (h *EventHandler) bookEvent(c echo.Context) error {
 		return models.ErrUnauthorized
 	}
 
-	var body struct {
-		Seats int `json:"seats"`
-	}
+	// Named type, not an anonymous struct: OpenAPI can only reference a named
+	// schema, and it makes the request contract visible from outside the file.
+	var body BookRequest
 	if err := c.Bind(&body); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid JSON body")
 	}
@@ -169,6 +251,19 @@ func (h *EventHandler) bookEvent(c echo.Context) error {
 // DELETE is the right verb: it removes a resource (this user's booking). The
 // promotion is a side effect the response reports, so the client can see that
 // their cancellation actually let someone else in.
+//	@Summary		Cancel a booking (promotes from the waitlist)
+//	@Description	Requires authentication. Frees your seats and immediately promotes the
+//	@Description	longest-waiting users who fit — all in one transaction, so the freed seats
+//	@Description	cannot be taken by a new arrival before the queue gets them.
+//	@Description	The response lists who was promoted.
+//	@Tags			bookings
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			id	path		int	true	"event id"
+//	@Success		200	{object}	models.CancelResult
+//	@Failure		401	{object}	handlers.ErrorResponse
+//	@Failure		404	{object}	handlers.ErrorResponse	"you have no booking for this event"
+//	@Router			/events/{id}/book [delete]
 func (h *EventHandler) cancelBooking(c echo.Context) error {
 	id, err := intParam(c, "id")
 	if err != nil {
@@ -186,6 +281,15 @@ func (h *EventHandler) cancelBooking(c echo.Context) error {
 }
 
 // myWaitlist shows what the user is queued for, and their position in each line.
+//	@Summary		My waitlist entries (with queue position)
+//	@Description	Requires authentication. `position` is 1-based and computed at read time
+//	@Description	from arrival order — it is not stored, so it is never stale.
+//	@Tags			me
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Success		200	{array}		models.WaitlistEntryWithEvent
+//	@Failure		401	{object}	handlers.ErrorResponse
+//	@Router			/me/waitlist [get]
 func (h *EventHandler) myWaitlist(c echo.Context) error {
 	userID, ok := UserIDFrom(c)
 	if !ok {
@@ -200,6 +304,15 @@ func (h *EventHandler) myWaitlist(c echo.Context) error {
 
 // myBookings — the JOIN endpoint. Scoped to the authenticated user, so there's
 // no way to read someone else's bookings by changing a URL parameter.
+//	@Summary		My bookings
+//	@Description	Requires authentication. Scoped to the token's user — there is no id in the
+//	@Description	URL to tamper with, so you cannot read anyone else's bookings.
+//	@Tags			me
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Success		200	{array}		models.BookingWithEvent
+//	@Failure		401	{object}	handlers.ErrorResponse
+//	@Router			/me/bookings [get]
 func (h *EventHandler) myBookings(c echo.Context) error {
 	userID, ok := UserIDFrom(c)
 	if !ok {
@@ -213,6 +326,14 @@ func (h *EventHandler) myBookings(c echo.Context) error {
 }
 
 // eventStats — the GROUP BY endpoint: how each event is selling.
+//	@Summary		Per-event sales stats
+//	@Description	Public. Booking count and seats sold per event, via GROUP BY with a
+//	@Description	LEFT JOIN — so events with zero bookings still appear.
+//	@Tags			events
+//	@Produce		json
+//	@Success		200	{array}		models.EventStat
+//	@Failure		500	{object}	handlers.ErrorResponse
+//	@Router			/events/stats [get]
 func (h *EventHandler) eventStats(c echo.Context) error {
 	stats, err := h.Store.EventStats()
 	if err != nil {
@@ -235,7 +356,7 @@ func errorHandler(err error, c echo.Context) {
 	// 409 for a duplicate email. Kept in auth.go next to the code that
 	// produces them, so the mapping lives beside its reasoning.
 	if s, m, handled := authStatus(err); handled {
-		_ = c.JSON(s, map[string]string{"error": m})
+		_ = c.JSON(s, ErrorResponse{Error: m})
 		return
 	}
 
@@ -254,7 +375,7 @@ func errorHandler(err error, c echo.Context) {
 			}
 		}
 	}
-	_ = c.JSON(status, map[string]string{"error": msg})
+	_ = c.JSON(status, ErrorResponse{Error: msg})
 }
 
 func intParam(c echo.Context, name string) (int, error) {

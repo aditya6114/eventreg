@@ -26,6 +26,22 @@ type Page[T any] struct {
 	HasMore bool `json:"has_more"`
 }
 
+// EventPage is Page[Event] under a concrete, non-generic name.
+//
+// WHY THIS EXISTS: OpenAPI has no concept of generics — every schema must be a
+// concrete named type — and swaggo cannot resolve an instantiated generic like
+// `Page[Event]` in an annotation. So the Swagger annotations reference
+// models.EventPage instead.
+//
+// `=` makes this a type ALIAS, not a new type: EventPage and Page[Event] are
+// literally the same type to the compiler. No conversion, no duplication, no
+// runtime cost — purely a second name so the documentation tooling has
+// something it can point at.
+//
+// A small, honest tax for using generics in an API that must also produce an
+// OpenAPI spec. Worth knowing before you reach for generics on a public type.
+type EventPage = Page[Event]
+
 // Pagination limits. Exported so handlers and stores agree on one definition.
 const (
 	DefaultLimit = 20  // sensible page size when the client doesn't ask

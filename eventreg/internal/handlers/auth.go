@@ -41,18 +41,31 @@ func (h *AuthHandler) Register(e *echo.Echo) {
 	e.GET("/auth/me", h.me, h.RequireAuth)
 }
 
-type credentials struct {
+type Credentials struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 }
 
-type tokenResponse struct {
+type TokenResponse struct {
 	Token string      `json:"token"`
 	User  models.User `json:"user"`
 }
 
+//	@Summary		Register a new account
+//	@Description	Creates the user and returns a JWT immediately, so a fresh signup does not
+//	@Description	have to log in with the credentials it just typed.
+//	@Description	Passwords are stored as bcrypt hashes and are never returned.
+//	@Tags			auth
+//	@Accept			json
+//	@Produce		json
+//	@Param			credentials	body		handlers.Credentials	true	"email and password (min 8 chars)"
+//	@Success		201			{object}	handlers.TokenResponse
+//	@Failure		400			{object}	handlers.ErrorResponse	"malformed JSON"
+//	@Failure		409			{object}	handlers.ErrorResponse	"email already registered"
+//	@Failure		422			{object}	handlers.ErrorResponse	"invalid email or password too short"
+//	@Router			/auth/register [post]
 func (h *AuthHandler) register(c echo.Context) error {
-	var in credentials
+	var in Credentials
 	if err := c.Bind(&in); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid JSON body")
 	}
@@ -82,11 +95,25 @@ func (h *AuthHandler) register(c echo.Context) error {
 	}
 	// 201 Created: registering created a new resource (the user).
 	// user serializes WITHOUT the password hash thanks to `json:"-"`.
-	return c.JSON(http.StatusCreated, tokenResponse{Token: token, User: user})
+	return c.JSON(http.StatusCreated, TokenResponse{Token: token, User: user})
 }
 
+//	@Summary		Log in and get a JWT
+//	@Description	Returns 200 (not 201) — logging in creates no resource.
+//	@Description
+//	@Description	An unknown email and a wrong password return the SAME 401 with the SAME
+//	@Description	message, deliberately: distinguishing them would let an attacker enumerate
+//	@Description	which addresses have accounts.
+//	@Tags			auth
+//	@Accept			json
+//	@Produce		json
+//	@Param			credentials	body		handlers.Credentials	true	"email and password"
+//	@Success		200			{object}	handlers.TokenResponse
+//	@Failure		400			{object}	handlers.ErrorResponse	"malformed JSON"
+//	@Failure		401			{object}	handlers.ErrorResponse	"invalid email or password"
+//	@Router			/auth/login [post]
 func (h *AuthHandler) login(c echo.Context) error {
-	var in credentials
+	var in Credentials
 	if err := c.Bind(&in); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid JSON body")
 	}
@@ -110,9 +137,18 @@ func (h *AuthHandler) login(c echo.Context) error {
 		return err
 	}
 	// 200 OK, not 201: logging in didn't create a resource.
-	return c.JSON(http.StatusOK, tokenResponse{Token: token, User: user})
+	return c.JSON(http.StatusOK, TokenResponse{Token: token, User: user})
 }
 
+//	@Summary		Who am I
+//	@Description	Requires authentication. Returns the account belonging to the token —
+//	@Description	the simplest proof that the auth middleware is working.
+//	@Tags			auth
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Success		200	{object}	models.User
+//	@Failure		401	{object}	handlers.ErrorResponse
+//	@Router			/auth/me [get]
 func (h *AuthHandler) me(c echo.Context) error {
 	id, ok := UserIDFrom(c)
 	if !ok {

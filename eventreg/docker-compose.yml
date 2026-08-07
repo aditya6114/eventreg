@@ -1,0 +1,147 @@
+# docker-compose: the whole stack, one command.
+#
+#   docker compose up --build       start everything (build the API first)
+#   docker compose up -d            start detached (in the background)
+#   docker compose logs -f api      follow the API's logs
+#   docker compose ps               what's running
+#   docker compose down             stop and remove containers (KEEPS the volume)
+#   docker compose down -v          ...and delete the database volume too
+#
+# Compose replaces the manual `docker run --name eventgo-pg -e ... -p ...`
+# command from lesson 8. That worked, but it lived in your shell history. This
+# file is checked into git, so the stack is reproducible by anyone who clones
+# the repo — including you, on a new machine, in six months.
+
+services:
+  # ------------------------------------------------------------- postgres --
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: eventgo
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: eventgo
+    ports:
+      # "host:container". Publishing 5432 is ONLY so you can reach the database
+      # from your laptop (psql, a GUI client, `go run ./cmd/api` outside
+      # Docker). The api service does NOT need this — see the networking note
+      # below. In production you would remove this line entirely: an exposed
+      # database port is an unnecessary attack surface.
+      - "5432:5432"
+    volumes:
+      # NAMED VOLUME. A container's filesystem is ephemeral — delete the
+      # container and its data is gone. A volume is storage managed by Docker
+      # that OUTLIVES the container, which is what makes `docker compose down`
+      # followed by `up` keep your data. (`down -v` deletes it deliberately.)
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # HEALTHCHECK: a command Docker runs periodically to decide if this
+      # service is not just RUNNING but actually READY.
+      #
+      # The distinction matters enormously here. Postgres accepts a TCP
+      # connection a moment before it's ready to serve queries, so "the
+      # container started" is NOT "the database works". pg_isready is the
+      # official readiness probe.
+      test: ["CMD-SHELL", "pg_isready -U eventgo -d eventgo"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      # start_period: failures during this window don't count against retries,
+      # giving a slow first boot room to initialise the data directory.
+      start_period: 10s
+
+  # ---------------------------------------------------------------- redis --
+  redis:
+    image: redis:7-alpine
+    ports:
+      # Same reasoning as postgres: published only so YOU can poke it with
+      # redis-cli from the host. The api reaches it over the compose network.
+      - "6379:6379"
+    command: >
+      redis-server
+      --appendonly no
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    # --appendonly no: we use Redis purely as a CACHE and lock store here, so
+    #   there is nothing worth persisting. Every key is either regenerable from
+    #   Postgres or intentionally short-lived. Disabling the append-only log
+    #   removes disk I/O from the hot path.
+    #
+    # --maxmemory + allkeys-lru: THE setting people forget. Redis is IN-MEMORY;
+    #   without a cap it will happily consume all the RAM on the box and get
+    #   OOM-killed. With a cap and an eviction policy it stays bounded and drops
+    #   the Least Recently Used keys when full — which is exactly the right
+    #   behaviour for a cache, where losing a key just means a slower request.
+    #   (If you were storing anything NOT regenerable, allkeys-lru would be
+    #   dangerous — you'd want `noeviction` and to treat OOM as a real error.)
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ------------------------------------------------------------------ api --
+  api:
+    build:
+      context: .          # send this directory as the build context
+      dockerfile: Dockerfile
+    environment:
+      # ---- THE NETWORKING LESSON ----
+      # The host is `postgres` — the SERVICE NAME, not localhost, not an IP.
+      #
+      # Compose puts every service on a shared network with an internal DNS
+      # server, so containers reach each other by service name. Docker resolves
+      # `postgres` to whatever IP that container currently has, which is what
+      # makes the setup survive restarts and rescheduling.
+      #
+      # WHY NOT localhost: inside a container, localhost is THAT CONTAINER.
+      # `localhost:5432` from the api container means "port 5432 of the api
+      # container" — nothing is listening there. This is the single most common
+      # first-time Docker networking mistake.
+      #
+      # Note also the port is 5432, the CONTAINER's port. The "5432:5432"
+      # mapping above is for your laptop; container-to-container traffic
+      # doesn't go through it.
+      DATABASE_URL: postgres://eventgo:secret@postgres:5432/eventgo?sslmode=disable
+
+      # Same service-name DNS rule as postgres. Empty/unset disables caching
+      # entirely — the app must work without Redis (see the explanation on
+      # graceful degradation).
+      REDIS_URL: redis://redis:6379/0
+      CACHE_TTL: 30s
+
+      # Everything below is lesson 14's config layer paying off: the image is
+      # identical in every environment, and only these values change.
+      APP_ENV: development
+      PORT: "8082"
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+      SHUTDOWN_TIMEOUT: 15s
+
+      # DEV ONLY. Real secrets belong in a .env file (gitignored) or a secrets
+      # manager — never committed. Compose reads a sibling .env automatically,
+      # so in a real setup this line would be:
+      #     JWT_SECRET: ${JWT_SECRET}
+      JWT_SECRET: local-dev-secret-at-least-32-characters-long
+
+    ports:
+      - "8082:8082"
+
+    depends_on:
+      postgres:
+        # `depends_on` ALONE only waits for the container to START, not to be
+        # usable — which for a database is nearly useless. `condition:
+        # service_healthy` waits for the healthcheck above to pass.
+        #
+        # Without this, the API starts first, migrations fail to connect, and
+        # the container exits. You'd see it "randomly" work depending on which
+        # container won the race.
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    # Restart if the process exits unexpectedly, but NOT if we deliberately
+    # stopped it. Handy while developing; in Kubernetes the scheduler owns this.
+    restart: unless-stopped
+
+volumes:
+  pgdata:
