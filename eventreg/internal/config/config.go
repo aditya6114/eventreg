@@ -38,6 +38,11 @@ type Config struct {
 
 	DatabaseURL string // empty => in-memory store
 
+	// RedisURL empty => caching disabled entirely. The app MUST work without
+	// Redis: a cache is an optimization, never a dependency.
+	RedisURL string
+	CacheTTL time.Duration
+
 	JWTSecret []byte
 	TokenTTL  time.Duration
 
@@ -63,6 +68,8 @@ func Load() (Config, error) {
 		Env:             getEnv("APP_ENV", "development"),
 		Port:            getEnv("PORT", "8082"),
 		DatabaseURL:     getEnv("DATABASE_URL", ""),
+		RedisURL:        getEnv("REDIS_URL", ""),
+		CacheTTL:        getEnvDuration("CACHE_TTL", 30*time.Second),
 		TokenTTL:        getEnvDuration("TOKEN_TTL", 24*time.Hour),
 		LogFormat:       getEnv("LOG_FORMAT", ""), // resolved below
 		ShutdownTimeout: getEnvDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
