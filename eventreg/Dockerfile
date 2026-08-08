@@ -58,10 +58,23 @@ COPY . .
 #
 # -trimpath removes absolute filesystem paths from the binary, making builds
 # reproducible and not leaking your directory layout.
+# TWO BINARIES from one build stage (lesson 20). The API and the notification
+# service share this module — the same models, config, and logging packages —
+# so building both here costs almost nothing (the compile cache is shared) and
+# guarantees they're built from identical source.
+#
+# One IMAGE ships both; compose picks which to run by overriding ENTRYPOINT.
+# The alternative — a separate image per service — is more "correct" for
+# independent deployment, but for two services in one repo this keeps the build
+# simple and the versions impossible to skew.
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w" \
-    -o /out/api ./cmd/api
+    -o /out/api ./cmd/api \
+ && CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/notifier ./cmd/notifier
 
 
 # ============================================================ STAGE 2: run
@@ -85,7 +98,8 @@ WORKDIR /app
 
 # Copy ONLY the binary from the builder stage. The Go toolchain, module cache,
 # and source code are all left behind.
-COPY --from=builder /out/api /app/api
+COPY --from=builder /out/api      /app/api
+COPY --from=builder /out/notifier /app/notifier
 
 USER appuser
 

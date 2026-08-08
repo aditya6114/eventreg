@@ -33,12 +33,24 @@ func NewAuth(users storage.UserStore, secret []byte, ttl time.Duration) *AuthHan
 	return &AuthHandler{Users: users, Secret: secret, TokenTTL: ttl}
 }
 
-func (h *AuthHandler) Register(e *echo.Echo) {
-	e.POST("/auth/register", h.register)
-	e.POST("/auth/login", h.login)
+// Register wires the auth routes.
+//
+// `extra` is applied to all three routes — main.go uses it to attach a STRICTER
+// rate limiter here than the global one, because /auth/login is a password
+// oracle and every attempt costs ~100ms of bcrypt.
+//
+// WHY VARIADIC MIDDLEWARE RATHER THAN echo.Group: a first attempt used
+// `e.Group("/auth", limiter)` in main.go, which compiled, ran, and did
+// NOTHING — a group only applies its middleware to routes registered ON THE
+// GROUP. These routes are registered on the root instance, so the group was an
+// empty shell. Silent no-ops are the worst kind of bug; passing the middleware
+// explicitly to the routes that need it can't fail that way.
+func (h *AuthHandler) Register(e *echo.Echo, extra ...echo.MiddlewareFunc) {
+	e.POST("/auth/register", h.register, extra...)
+	e.POST("/auth/login", h.login, extra...)
 	// /auth/me is protected — it proves the middleware works and shows how to
 	// read the authenticated user back out of the context.
-	e.GET("/auth/me", h.me, h.RequireAuth)
+	e.GET("/auth/me", h.me, append([]echo.MiddlewareFunc{h.RequireAuth}, extra...)...)
 }
 
 type Credentials struct {

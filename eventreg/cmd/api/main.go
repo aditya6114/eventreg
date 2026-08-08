@@ -65,15 +65,16 @@
 //	@host		localhost:8082
 //	@BasePath	/
 
-//	@securityDefinitions.apikey	BearerAuth
-//	@in							header
-//	@name						Authorization
-//	@description				JWT from /auth/login. Format: "Bearer {token}"
+// @securityDefinitions.apikey	BearerAuth
+// @in							header
+// @name						Authorization
+// @description				JWT from /auth/login. Format: "Bearer {token}"
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -92,7 +93,10 @@ import (
 	"eventreg/internal/config"
 	"eventreg/internal/db"
 	"eventreg/internal/handlers"
+	"eventreg/internal/holds"
 	"eventreg/internal/logging"
+	"eventreg/internal/notify"
+	"eventreg/internal/ratelimit"
 	"eventreg/internal/storage"
 )
 
@@ -204,13 +208,102 @@ func run() error {
 	h := handlers.New(store)
 	authH := handlers.NewAuth(users, cfg.JWTSecret, cfg.TokenTTL)
 
+	// Seat holds need Redis. Without it we simply don't offer the endpoints —
+	// the API stays fully functional, just without a checkout window.
+	if redisClient != nil {
+		h = h.WithHolds(holds.New(redisClient, cfg.HoldTTL))
+		logger.Info("seat holds enabled", "ttl", cfg.HoldTTL.String())
+	}
+
+	// ---- NOTIFICATIONS over gRPC (lesson 20) ----
+	//
+	// grpc.NewClient does NOT dial eagerly, so this succeeds even when the
+	// notifier is down — the channel connects lazily and reconnects with
+	// backoff on its own. That's deliberate: the API must start and serve
+	// bookings whether or not notifications are available.
+	var notifier *notify.Client
+	if cfg.NotifierAddr != "" {
+		n, nErr := notify.New(cfg.NotifierAddr, cfg.NotifierTimeout, logger)
+		if nErr != nil {
+			// Even a setup failure is non-fatal. Bookings matter; emails don't.
+			logger.Warn("notifier unavailable; running without notifications", "error", nErr)
+		} else {
+			notifier = n
+			h = h.WithNotifier(n, users)
+			logger.Info("notifications enabled",
+				"target", cfg.NotifierAddr, "timeout", cfg.NotifierTimeout.String())
+		}
+	} else {
+		logger.Info("notifications disabled", "reason", "NOTIFIER_ADDR not set")
+	}
+
 	e := echo.New()
 	e.HideBanner = true // the ASCII art is noise in structured logs
 	e.HidePort = true   // we log the port ourselves, as a field
+
+	// ---- CLIENT IP BEHIND A PROXY (lesson 19) ----
+	//
+	// Once nginx fronts the API, the TCP peer is NGINX. Without this, c.RealIP()
+	// returns the proxy's address for every request and the rate limiter puts
+	// the entire internet in ONE bucket — so a single abusive client throttles
+	// everybody, and the limit stops meaning anything per-user.
+	//
+	// ExtractIPFromXFFHeader walks the X-Forwarded-For chain and returns the
+	// left-most address that isn't a trusted proxy. Echo trusts loopback and
+	// private ranges by default, which is exactly right for a container network.
+	//
+	// GATED ON CONFIG, and off by default: if you enable this WITHOUT a proxy
+	// that overwrites the header, any client can send its own X-Forwarded-For
+	// and forge an IP to escape the rate limiter.
+	if cfg.TrustProxy {
+		e.IPExtractor = echo.ExtractIPFromXFFHeader()
+		logger.Info("trusting proxy headers for client IP", "header", "X-Forwarded-For")
+	}
+
+	// Identify which replica served the request. Purely for demonstrating load
+	// balancing — in production you'd get this from tracing instead, and might
+	// not want to advertise your topology in a response header.
+	instance, _ := os.Hostname()
+	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			c.Response().Header().Set("X-Served-By", instance)
+			return next(c)
+		}
+	})
+
 	e.Use(logging.RequestLogger(logger))
 	e.Use(middleware.Recover())
 
-	authH.Register(e)
+	// ---- RATE LIMITING ----
+	//
+	// MIDDLEWARE ORDER MATTERS. The limiter goes AFTER the request logger (so
+	// rejected requests are still logged — you want to see the abuse) and
+	// BEFORE the routes (so a blocked request never reaches a handler or the
+	// database, which is the entire point).
+	var authMiddleware []echo.MiddlewareFunc
+	if redisClient != nil {
+		global := ratelimit.New(redisClient, cfg.RateLimitRequests, cfg.RateLimitWindow, "global")
+		e.Use(global.Middleware)
+
+		// A SECOND, STRICTER limiter just for auth. /auth/login is a password
+		// oracle and each attempt burns ~100ms of bcrypt, so it deserves a much
+		// tighter budget than browsing events. Layering limiters like this — a
+		// generous global one plus targeted strict ones — is the normal
+		// production shape, and both apply: a login must pass BOTH budgets.
+		//
+		// Passed explicitly to the auth routes rather than via e.Group, which
+		// would silently do nothing here (see AuthHandler.Register).
+		authLimit := ratelimit.New(redisClient, cfg.AuthRateLimitRequests, cfg.AuthRateLimitWindow, "auth")
+		authMiddleware = append(authMiddleware, authLimit.Middleware)
+
+		logger.Info("rate limiting enabled",
+			"global", fmt.Sprintf("%d/%s", cfg.RateLimitRequests, cfg.RateLimitWindow),
+			"auth", fmt.Sprintf("%d/%s", cfg.AuthRateLimitRequests, cfg.AuthRateLimitWindow))
+	} else {
+		logger.Warn("rate limiting disabled", "reason", "redis unavailable")
+	}
+
+	authH.Register(e, authMiddleware...)
 	h.Register(e, authH.RequireAuth)
 
 	// Swagger UI at /docs/index.html, served from the generated ./docs package.
@@ -320,6 +413,20 @@ func run() error {
 	// requests we just waited for.
 	// Same reverse-of-startup rule: connections close only after the server has
 	// drained, so in-flight requests keep working right up to the end.
+	//
+	// NOTE a known wrinkle: notifications are fired in background goroutines
+	// that outlive the request, so closing here can cancel one mid-flight. The
+	// clean fix is a WaitGroup tracking in-flight notifications, drained before
+	// close. Left as-is deliberately — a dropped notification during shutdown
+	// is exactly the degradation this design already tolerates, and pretending
+	// otherwise would be worse than naming it.
+	if notifier != nil {
+		if err := notifier.Close(); err != nil {
+			logger.Warn("notifier close failed", "error", err)
+		} else {
+			logger.Info("notifier connection closed")
+		}
+	}
 	if redisClient != nil {
 		if err := redisClient.Close(); err != nil {
 			logger.Warn("redis close failed", "error", err)

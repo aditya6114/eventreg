@@ -1,0 +1,22 @@
+# What to generate, and where.
+#
+# TWO plugins, because they do different jobs:
+#   protoc-gen-go       -> the MESSAGE types (structs, marshalling)
+#   protoc-gen-go-grpc  -> the SERVICE code (client struct, server interface)
+#
+# They're separate because plenty of projects use protobuf purely as a
+# serialization format with no RPC at all.
+#
+# Regenerate after ANY change to a .proto:
+#   buf generate
+version: v1
+plugins:
+  - plugin: go
+    out: gen
+    opt: paths=source_relative
+  - plugin: go-grpc
+    out: gen
+    opt: paths=source_relative
+# paths=source_relative mirrors the proto directory structure into gen/, so
+# proto/notification/v1/notification.proto -> gen/notification/v1/*.go
+# The alternative (module=...) derives paths from go_package and is fussier.

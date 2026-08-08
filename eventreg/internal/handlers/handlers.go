@@ -11,7 +11,9 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"eventreg/internal/holds"
 	"eventreg/internal/models"
+	"eventreg/internal/notify"
 	"eventreg/internal/storage"
 )
 
@@ -41,11 +43,78 @@ type BookRequest struct {
 // the code testable — a test can inject a fake Store.
 type EventHandler struct {
 	Store storage.Store
+	// Holds is OPTIONAL — nil when Redis isn't configured. Every use is
+	// nil-guarded so the API keeps working without Redis, same principle as
+	// the cache: an optimization, never a dependency.
+	Holds *holds.Manager
+
+	// Notifier is OPTIONAL for the same reason, and here it matters most: a
+	// booking must succeed whether or not anyone can be told about it.
+	Notifier *notify.Client
+
+	// Users lets us look up an email to notify. Optional alongside Notifier.
+	Users storage.UserStore
 }
 
 // New builds the handler with its dependency.
 func New(s storage.Store) *EventHandler {
 	return &EventHandler{Store: s}
+}
+
+// WithHolds enables the seat-hold endpoints. Returning the handler allows
+// chaining, and keeps New() unchanged for callers that don't need holds.
+func (h *EventHandler) WithHolds(m *holds.Manager) *EventHandler {
+	h.Holds = m
+	return h
+}
+
+// WithNotifier enables outbound notifications. Needs the user store too, to
+// resolve an email address from the id in the JWT.
+func (h *EventHandler) WithNotifier(n *notify.Client, users storage.UserStore) *EventHandler {
+	h.Notifier = n
+	h.Users = users
+	return h
+}
+
+// notifyBooking fires notifications for a booking outcome.
+//
+// Every call site is best-effort by construction: notify.Send returns
+// immediately and never reports failure, so there is no way for a notification
+// problem to affect the booking. That's the graceful-degradation guarantee
+// enforced by the SHAPE of the API rather than by remembering to ignore errors.
+func (h *EventHandler) notifyBooking(userID int, ev models.Event, res models.BookingResult) {
+	if h.Notifier == nil || h.Users == nil {
+		return
+	}
+	user, err := h.Users.GetUserByID(userID)
+	if err != nil {
+		return // can't notify someone we can't identify; not worth failing over
+	}
+
+	var (
+		t     notify.Type
+		seats int
+	)
+	switch res.Outcome {
+	case models.OutcomeBooked:
+		t, seats = notify.TypeBookingConfirmed, res.Booking.Seats
+	case models.OutcomeWaitlisted:
+		t, seats = notify.TypeWaitlisted, res.Waitlist.Seats
+	default:
+		// An idempotent replay: they were already told the first time. Sending
+		// again would mean an email per retry.
+		return
+	}
+
+	h.Notifier.Send(notify.Notification{
+		UserID:         userID,
+		Email:          user.Email,
+		Type:           t,
+		EventID:        ev.ID,
+		EventName:      ev.Name,
+		Seats:          seats,
+		IdempotencyKey: notify.Key(userID, ev.ID, t),
+	})
 }
 
 // Register wires all routes and the central error handler onto an Echo
@@ -83,6 +152,91 @@ func (h *EventHandler) Register(e *echo.Echo, protect echo.MiddlewareFunc) {
 	// avoiding a user id in the URL that someone would inevitably tamper with.
 	e.GET("/me/bookings", h.myBookings, protect)
 	e.GET("/me/waitlist", h.myWaitlist, protect)
+
+	// Seat holds (lesson 18). Registered only when Redis is available —
+	// advertising an endpoint that can't work would be worse than omitting it.
+	if h.Holds != nil {
+		e.POST("/events/:id/hold", h.createHold, protect)
+		e.DELETE("/events/:id/hold", h.releaseHold, protect)
+	}
+}
+
+// @Summary		Hold seats temporarily (checkout window)
+// @Description	Requires authentication. Reserves seats for a few minutes so the user can
+// @Description	complete checkout without someone else taking them.
+// @Description
+// @Description	The hold **expires by itself** — if the user abandons checkout, the seats
+// @Description	return to the pool with no cleanup job involved.
+// @Description
+// @Description	Holding again replaces the previous hold rather than stacking on it.
+// @Tags			bookings
+// @Accept			json
+// @Produce		json
+// @Security		BearerAuth
+// @Param			id		path		int						true	"event id"
+// @Param			body	body		handlers.BookRequest	true	"seats to hold"
+// @Success		201		{object}	holds.Hold
+// @Failure		401		{object}	handlers.ErrorResponse
+// @Failure		404		{object}	handlers.ErrorResponse	"no such event"
+// @Failure		409		{object}	handlers.ErrorResponse	"not enough seats available"
+// @Failure		422		{object}	handlers.ErrorResponse	"seats <= 0"
+// @Router			/events/{id}/hold [post]
+func (h *EventHandler) createHold(c echo.Context) error {
+	id, err := intParam(c, "id")
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "id must be a number")
+	}
+	userID, ok := UserIDFrom(c)
+	if !ok {
+		return models.ErrUnauthorized
+	}
+	var body BookRequest
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid JSON body")
+	}
+	if body.Seats <= 0 {
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, "seats must be > 0")
+	}
+
+	// CAPACITY COMES FROM POSTGRES. Redis has no idea what an event is — the
+	// application joins the two, exactly as in cache-aside. This read is also
+	// what makes a 404 possible for an event that doesn't exist.
+	event, err := h.Store.Get(id)
+	if err != nil {
+		return err // -> 404
+	}
+
+	hold, err := h.Holds.Acquire(c.Request().Context(), id, userID, body.Seats, event.Seats)
+	if err != nil {
+		return err // ErrInsufficientSeats -> 409, mapped centrally
+	}
+	return c.JSON(http.StatusCreated, hold)
+}
+
+// @Summary		Release a seat hold
+// @Description	Requires authentication. Frees a hold early (user cancelled checkout).
+// @Description	Releasing a hold that already expired is a successful no-op.
+// @Tags			bookings
+// @Produce		json
+// @Security		BearerAuth
+// @Param			id	path	int	true	"event id"
+// @Success		204	"released"
+// @Failure		401	{object}	handlers.ErrorResponse
+// @Router			/events/{id}/hold [delete]
+func (h *EventHandler) releaseHold(c echo.Context) error {
+	id, err := intParam(c, "id")
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "id must be a number")
+	}
+	userID, ok := UserIDFrom(c)
+	if !ok {
+		return models.ErrUnauthorized
+	}
+	if err := h.Holds.Release(c.Request().Context(), id, userID); err != nil {
+		return err
+	}
+	// 204 No Content: it worked, and there's nothing meaningful to return.
+	return c.NoContent(http.StatusNoContent)
 }
 
 // health godoc
@@ -129,14 +283,14 @@ func (h *EventHandler) listEvents(c echo.Context) error {
 	return c.JSON(http.StatusOK, page)
 }
 
-//	@Summary		Get one event
-//	@Tags			events
-//	@Produce		json
-//	@Param			id	path		int	true	"event id"
-//	@Success		200	{object}	models.Event
-//	@Failure		400	{object}	handlers.ErrorResponse	"id is not a number"
-//	@Failure		404	{object}	handlers.ErrorResponse	"no such event"
-//	@Router			/events/{id} [get]
+// @Summary		Get one event
+// @Tags			events
+// @Produce		json
+// @Param			id	path		int	true	"event id"
+// @Success		200	{object}	models.Event
+// @Failure		400	{object}	handlers.ErrorResponse	"id is not a number"
+// @Failure		404	{object}	handlers.ErrorResponse	"no such event"
+// @Router			/events/{id} [get]
 func (h *EventHandler) getEvent(c echo.Context) error {
 	id, err := intParam(c, "id")
 	if err != nil {
@@ -149,18 +303,18 @@ func (h *EventHandler) getEvent(c echo.Context) error {
 	return c.JSON(http.StatusOK, e)
 }
 
-//	@Summary		Create an event
-//	@Description	Requires authentication. `id` in the body is ignored — the database assigns it.
-//	@Tags			events
-//	@Accept			json
-//	@Produce		json
-//	@Security		BearerAuth
-//	@Param			event	body		models.Event	true	"name and seats"
-//	@Success		201		{object}	models.Event
-//	@Failure		400		{object}	handlers.ErrorResponse	"malformed JSON"
-//	@Failure		401		{object}	handlers.ErrorResponse	"missing or invalid token"
-//	@Failure		422		{object}	handlers.ErrorResponse	"name empty or seats <= 0"
-//	@Router			/events [post]
+// @Summary		Create an event
+// @Description	Requires authentication. `id` in the body is ignored — the database assigns it.
+// @Tags			events
+// @Accept			json
+// @Produce		json
+// @Security		BearerAuth
+// @Param			event	body		models.Event	true	"name and seats"
+// @Success		201		{object}	models.Event
+// @Failure		400		{object}	handlers.ErrorResponse	"malformed JSON"
+// @Failure		401		{object}	handlers.ErrorResponse	"missing or invalid token"
+// @Failure		422		{object}	handlers.ErrorResponse	"name empty or seats <= 0"
+// @Router			/events [post]
 func (h *EventHandler) createEvent(c echo.Context) error {
 	var in models.Event
 	if err := c.Bind(&in); err != nil {
@@ -176,29 +330,29 @@ func (h *EventHandler) createEvent(c echo.Context) error {
 	return c.JSON(http.StatusCreated, created)
 }
 
-//	@Summary		Book seats (auto-waitlists if full)
-//	@Description	Requires authentication. The booking is attributed to the token's user.
-//	@Description
-//	@Description	**Idempotent**: repeating the same request returns the original booking
-//	@Description	with `outcome: already_booked` and does not consume more seats.
-//	@Description
-//	@Description	Status codes carry the outcome:
-//	@Description	- **201** `booked` — a new booking exists
-//	@Description	- **202** `waitlisted` — event was full, you were queued
-//	@Description	- **200** `already_booked` / `already_waitlisted` — replay, nothing changed
-//	@Tags			bookings
-//	@Accept			json
-//	@Produce		json
-//	@Security		BearerAuth
-//	@Param			id		path		int						true	"event id"
-//	@Param			body	body		handlers.BookRequest	true	"seats to book"
-//	@Success		201		{object}	models.BookingResult	"booked"
-//	@Success		202		{object}	models.BookingResult	"waitlisted"
-//	@Success		200		{object}	models.BookingResult	"idempotent replay"
-//	@Failure		401		{object}	handlers.ErrorResponse
-//	@Failure		404		{object}	handlers.ErrorResponse	"no such event"
-//	@Failure		422		{object}	handlers.ErrorResponse	"seats <= 0"
-//	@Router			/events/{id}/book [post]
+// @Summary		Book seats (auto-waitlists if full)
+// @Description	Requires authentication. The booking is attributed to the token's user.
+// @Description
+// @Description	**Idempotent**: repeating the same request returns the original booking
+// @Description	with `outcome: already_booked` and does not consume more seats.
+// @Description
+// @Description	Status codes carry the outcome:
+// @Description	- **201** `booked` — a new booking exists
+// @Description	- **202** `waitlisted` — event was full, you were queued
+// @Description	- **200** `already_booked` / `already_waitlisted` — replay, nothing changed
+// @Tags			bookings
+// @Accept			json
+// @Produce		json
+// @Security		BearerAuth
+// @Param			id		path		int						true	"event id"
+// @Param			body	body		handlers.BookRequest	true	"seats to book"
+// @Success		201		{object}	models.BookingResult	"booked"
+// @Success		202		{object}	models.BookingResult	"waitlisted"
+// @Success		200		{object}	models.BookingResult	"idempotent replay"
+// @Failure		401		{object}	handlers.ErrorResponse
+// @Failure		404		{object}	handlers.ErrorResponse	"no such event"
+// @Failure		422		{object}	handlers.ErrorResponse	"seats <= 0"
+// @Router			/events/{id}/book [post]
 func (h *EventHandler) bookEvent(c echo.Context) error {
 	id, err := intParam(c, "id")
 	if err != nil {
@@ -227,6 +381,21 @@ func (h *EventHandler) bookEvent(c echo.Context) error {
 		return err // 404 not found, decided centrally
 	}
 
+	// The hold has done its job: the seats are now really gone from Postgres,
+	// so leaving the hold in place would double-count them and make the event
+	// look emptier than it is. Best-effort — if this fails the hold simply
+	// expires on its own in a few minutes, which is the whole point of a TTL.
+	if h.Holds != nil && res.Outcome == models.OutcomeBooked {
+		if rErr := h.Holds.Release(c.Request().Context(), id, userID); rErr != nil {
+			c.Logger().Warnf("hold release failed (will expire via TTL): %v", rErr)
+		}
+	}
+
+	// Tell the user what happened. Fire-and-forget — see notifyBooking.
+	if ev, gErr := h.Store.Get(id); gErr == nil {
+		h.notifyBooking(userID, ev, res)
+	}
+
 	// THE STATUS CODE CARRIES THE MEANING. Four outcomes, four honest answers:
 	//
 	//   201 Created  — a new booking exists
@@ -251,6 +420,7 @@ func (h *EventHandler) bookEvent(c echo.Context) error {
 // DELETE is the right verb: it removes a resource (this user's booking). The
 // promotion is a side effect the response reports, so the client can see that
 // their cancellation actually let someone else in.
+//
 //	@Summary		Cancel a booking (promotes from the waitlist)
 //	@Description	Requires authentication. Frees your seats and immediately promotes the
 //	@Description	longest-waiting users who fit — all in one transaction, so the freed seats
@@ -277,10 +447,39 @@ func (h *EventHandler) cancelBooking(c echo.Context) error {
 	if err != nil {
 		return err // 404 if they had no booking
 	}
+
+	// THE NOTIFICATION THAT ACTUALLY MATTERS.
+	//
+	// Everyone promoted off the waitlist by this cancellation just got a seat —
+	// and they are NOT looking at the page. Without a notification they'd never
+	// find out. This is the concrete reason lesson 12's waitlist needed a
+	// notification service at all, and why the two lessons belong together.
+	if h.Notifier != nil && h.Users != nil && len(res.Promoted) > 0 {
+		if ev, gErr := h.Store.Get(id); gErr == nil {
+			for _, b := range res.Promoted {
+				user, uErr := h.Users.GetUserByID(b.UserID)
+				if uErr != nil {
+					continue
+				}
+				h.Notifier.Send(notify.Notification{
+					UserID:    b.UserID,
+					Email:     user.Email,
+					Type:      notify.TypePromotedFromWaitlist,
+					EventID:   ev.ID,
+					EventName: ev.Name,
+					Seats:     b.Seats,
+					IdempotencyKey: notify.Key(b.UserID, ev.ID,
+						notify.TypePromotedFromWaitlist),
+				})
+			}
+		}
+	}
+
 	return c.JSON(http.StatusOK, res)
 }
 
 // myWaitlist shows what the user is queued for, and their position in each line.
+//
 //	@Summary		My waitlist entries (with queue position)
 //	@Description	Requires authentication. `position` is 1-based and computed at read time
 //	@Description	from arrival order — it is not stored, so it is never stale.
@@ -304,6 +503,7 @@ func (h *EventHandler) myWaitlist(c echo.Context) error {
 
 // myBookings — the JOIN endpoint. Scoped to the authenticated user, so there's
 // no way to read someone else's bookings by changing a URL parameter.
+//
 //	@Summary		My bookings
 //	@Description	Requires authentication. Scoped to the token's user — there is no id in the
 //	@Description	URL to tamper with, so you cannot read anyone else's bookings.
@@ -326,6 +526,7 @@ func (h *EventHandler) myBookings(c echo.Context) error {
 }
 
 // eventStats — the GROUP BY endpoint: how each event is selling.
+//
 //	@Summary		Per-event sales stats
 //	@Description	Public. Booking count and seats sold per event, via GROUP BY with a
 //	@Description	LEFT JOIN — so events with zero bookings still appear.
@@ -357,6 +558,13 @@ func errorHandler(err error, c echo.Context) {
 	// produces them, so the mapping lives beside its reasoning.
 	if s, m, handled := authStatus(err); handled {
 		_ = c.JSON(s, ErrorResponse{Error: m})
+		return
+	}
+
+	// A hold that can't fit is a CONFLICT with current state — the same
+	// reasoning as a sold-out event, so the same 409.
+	if errors.Is(err, holds.ErrInsufficientSeats) {
+		_ = c.JSON(http.StatusConflict, ErrorResponse{Error: err.Error()})
 		return
 	}
 

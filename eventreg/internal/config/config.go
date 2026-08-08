@@ -43,6 +43,34 @@ type Config struct {
 	RedisURL string
 	CacheTTL time.Duration
 
+	// HoldTTL is the checkout window: how long a seat hold survives before it
+	// releases itself. Long enough to pay, short enough that abandoned
+	// checkouts don't strangle a popular event.
+	HoldTTL time.Duration
+
+	// TrustProxy enables reading the client IP from X-Forwarded-For /
+	// X-Real-IP instead of the TCP peer address.
+	//
+	// ⚠️ ONLY enable this when a proxy you CONTROL is the sole entry point and
+	// always overwrites those headers. They are client-supplied otherwise, so
+	// trusting them lets anyone forge an IP and walk straight past the rate
+	// limiter — which would make the limiter worse than useless, since it would
+	// still throttle honest users while waving attackers through.
+	TrustProxy bool
+
+	// NotifierAddr is the gRPC target for the notification service.
+	// Empty => notifications disabled. The API is fully functional without it,
+	// which is the whole graceful-degradation point.
+	NotifierAddr    string
+	NotifierTimeout time.Duration
+
+	// Rate limits. Auth is stricter than the general limit because /auth/login
+	// is a password oracle and each attempt costs us ~100ms of bcrypt.
+	RateLimitRequests     int
+	RateLimitWindow       time.Duration
+	AuthRateLimitRequests int
+	AuthRateLimitWindow   time.Duration
+
 	JWTSecret []byte
 	TokenTTL  time.Duration
 
@@ -65,14 +93,24 @@ func (c Config) IsProduction() bool { return c.Env == "production" }
 // incident.
 func Load() (Config, error) {
 	cfg := Config{
-		Env:             getEnv("APP_ENV", "development"),
-		Port:            getEnv("PORT", "8082"),
-		DatabaseURL:     getEnv("DATABASE_URL", ""),
-		RedisURL:        getEnv("REDIS_URL", ""),
-		CacheTTL:        getEnvDuration("CACHE_TTL", 30*time.Second),
-		TokenTTL:        getEnvDuration("TOKEN_TTL", 24*time.Hour),
-		LogFormat:       getEnv("LOG_FORMAT", ""), // resolved below
-		ShutdownTimeout: getEnvDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
+		Env:         getEnv("APP_ENV", "development"),
+		Port:        getEnv("PORT", "8082"),
+		DatabaseURL: getEnv("DATABASE_URL", ""),
+		RedisURL:    getEnv("REDIS_URL", ""),
+		CacheTTL:    getEnvDuration("CACHE_TTL", 30*time.Second),
+		HoldTTL:     getEnvDuration("HOLD_TTL", 5*time.Minute),
+		TrustProxy:  getEnvBool("TRUST_PROXY", false), // secure by default
+
+		NotifierAddr:    getEnv("NOTIFIER_ADDR", ""),
+		NotifierTimeout: getEnvDuration("NOTIFIER_TIMEOUT", 2*time.Second),
+
+		RateLimitRequests:     getEnvInt("RATE_LIMIT_REQUESTS", 100),
+		RateLimitWindow:       getEnvDuration("RATE_LIMIT_WINDOW", time.Minute),
+		AuthRateLimitRequests: getEnvInt("AUTH_RATE_LIMIT_REQUESTS", 10),
+		AuthRateLimitWindow:   getEnvDuration("AUTH_RATE_LIMIT_WINDOW", time.Minute),
+		TokenTTL:              getEnvDuration("TOKEN_TTL", 24*time.Hour),
+		LogFormat:             getEnv("LOG_FORMAT", ""), // resolved below
+		ShutdownTimeout:       getEnvDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
 	}
 
 	// Defaults that DEPEND on the environment, chosen for who's reading:
@@ -151,8 +189,23 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	return d
 }
 
-// getEnvInt is unused today but kept as the obvious next helper (pool sizes,
-// rate limits). Delete it if it's still unused by Week 3.
+// getEnvBool accepts the usual truthy spellings ("true", "1", "yes", "on").
+// Anything unrecognised falls back to the default — and since the default for
+// TRUST_PROXY is false, a typo fails SECURE rather than open.
+func getEnvBool(key string, fallback bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	}
+	return fallback
+}
+
 func getEnvInt(key string, fallback int) int {
 	v, ok := os.LookupEnv(key)
 	if !ok || v == "" {

@@ -9,6 +9,7 @@
 //   - exactly N requests get 200 OK
 //   - exactly W-N requests get 409 Conflict (sold out)
 //   - final seat count is EXACTLY 0 — never negative, never leftover
+//
 // If the locking were broken, you'd see more than N successes and/or a
 // negative seat count. That's an oversell, and it's the bug this whole
 // project exists to prevent.
@@ -18,8 +19,9 @@
 // knowledge attacking your own API.
 //
 // Run it with the server already running in another terminal:
-//   go run ./cmd/loadtest
-//   go run ./cmd/loadtest -seats=50 -workers=500
+//
+//	go run ./cmd/loadtest
+//	go run ./cmd/loadtest -seats=50 -workers=500
 package main
 
 import (
@@ -40,6 +42,11 @@ type event struct {
 	Name  string `json:"name"`
 	Seats int    `json:"seats"`
 }
+
+// runNonce distinguishes one run of this program from the next, so repeat runs
+// don't collide on the UNIQUE(email) constraint. Seconds is plenty here because
+// the collisions we hit were WITHIN a run (see registerUser).
+var runNonce = time.Now().Unix()
 
 // result is one worker's outcome: either an HTTP status, or the reason the
 // request never got one.
@@ -77,7 +84,7 @@ func main() {
 	// would book and the other 299 would be recognised as retries — we'd be
 	// testing idempotency, not seat contention. Distinct users = 300 people
 	// genuinely competing, which is the scenario we care about.
-	organiser, err := registerUser(client, *base)
+	organiser, err := registerUser(client, *base, -1)
 	if err != nil {
 		log.Fatal("register organiser: ", err)
 	}
@@ -121,12 +128,15 @@ func main() {
 
 	for i := 0; i < *workers; i++ {
 		wg.Add(1)
-		go func() {
+		// `i` is passed as an argument so each goroutine gets its own copy —
+		// and here it's load-bearing, not stylistic: it's what makes each
+		// worker's registration email unique (see registerUser).
+		go func(worker int) {
 			defer wg.Done() // guaranteed to run, even on an early return
 
 			// Register OUTSIDE the timed section — bcrypt would otherwise
 			// dominate the measurement and blur the contention we're testing.
-			token, err := registerUser(client, *base)
+			token, err := registerUser(client, *base, worker)
 			if err != nil {
 				ready.Done()
 				results <- result{status: 0, errMsg: "register: " + err.Error()}
@@ -144,7 +154,7 @@ func main() {
 				return
 			}
 			results <- result{status: status}
-		}()
+		}(i)
 	}
 
 	fmt.Println("registering users...")
@@ -152,7 +162,7 @@ func main() {
 	start := time.Now()
 	close(startGate) // <-- the starting gun
 
-	wg.Wait()      // block until every worker has finished
+	wg.Wait() // block until every worker has finished
 	elapsed := time.Since(start)
 	close(results) // safe to close now: all senders are done
 
@@ -174,10 +184,10 @@ func main() {
 	// Lesson 12 changed the losing case: a full event now WAITLISTS the user
 	// (202 Accepted) instead of rejecting them (409). "Losers" are still
 	// exactly workers-minus-seats, but they leave with a place in the queue.
-	ok := counts[http.StatusCreated]         // 201 — a new booking was made
+	ok := counts[http.StatusCreated]          // 201 — a new booking was made
 	waitlisted := counts[http.StatusAccepted] // 202 — queued, no seat yet
-	replay := counts[http.StatusOK]          // 200 — idempotent, nothing changed
-	conflict := counts[http.StatusConflict]  // 409 — should now be 0
+	replay := counts[http.StatusOK]           // 200 — idempotent, nothing changed
+	conflict := counts[http.StatusConflict]   // 409 — should now be 0
 	other := *workers - ok - waitlisted - replay - conflict
 
 	// ---- VERIFY against the server's actual final state ----
@@ -253,10 +263,16 @@ func main() {
 	}
 
 	if other != 0 {
-		fmt.Printf("\nNOTE (environment): %d of %d requests never reached the server.\n", other, *workers)
-		fmt.Println("  This is a client/OS connection limit, not an API bug — the requests")
-		fmt.Println("  that DID get through were all handled correctly. Try fewer workers")
-		fmt.Println("  (e.g. -workers=200), or run the client on a different machine.")
+		// Deliberately does NOT guess at the cause. An earlier version asserted
+		// "this is a connection limit", which was wrong the very first time it
+		// mattered — the real cause was duplicate registration emails. The
+		// distinct error strings printed above are the actual evidence; read
+		// those rather than trusting a canned explanation.
+		fmt.Printf("\nNOTE: %d of %d workers did not produce a booking result.\n", other, *workers)
+		fmt.Println("  See the error breakdown above for the actual cause. Common ones:")
+		fmt.Println("    'connection refused' / timeouts -> client or OS socket limits; use fewer workers")
+		fmt.Println("    '429'                           -> you hit your OWN rate limiter; raise it for the test")
+		fmt.Println("    'register: ... 409'             -> duplicate test emails; a uniqueness bug in this tool")
 	}
 
 	if !correct {
@@ -283,11 +299,23 @@ func doJSON(c *http.Client, method, url, token string, body []byte) (*http.Respo
 	return c.Do(req)
 }
 
-// registerUser creates a throwaway account and returns its JWT. The email is
-// timestamped so repeat runs don't collide with the UNIQUE(email) constraint.
-func registerUser(c *http.Client, base string) (string, error) {
+// registerUser creates a throwaway account and returns its JWT.
+//
+// THE EMAIL MUST BE UNIQUE PER WORKER **AND** PER RUN, and getting that wrong
+// produced a genuinely instructive failure:
+//
+// The first version used only time.Now().UnixNano(). That looks unique — but
+// on WINDOWS the system clock granularity is ~15ms, so 150 goroutines firing
+// simultaneously all read the SAME nanosecond value, generated the SAME email,
+// and 130 of 150 registrations came back 409 email-already-registered.
+//
+// Lesson: a timestamp is NOT a unique ID generator, especially not at high
+// concurrency and especially not on a platform with a coarse clock. Combine it
+// with something guaranteed distinct — here the worker index, plus a
+// process-run nonce so consecutive runs don't collide either.
+func registerUser(c *http.Client, base string, worker int) (string, error) {
 	body, _ := json.Marshal(map[string]any{
-		"email":    fmt.Sprintf("loadtest+%d@example.com", time.Now().UnixNano()),
+		"email":    fmt.Sprintf("loadtest+%d-%d@example.com", runNonce, worker),
 		"password": "loadtest-password",
 	})
 	resp, err := doJSON(c, http.MethodPost, base+"/auth/register", "", body)

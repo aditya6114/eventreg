@@ -1,0 +1,113 @@
+// The CONTRACT between the API and the notification service.
+//
+// This file is the single source of truth for both sides. `buf generate` turns
+// it into Go server interfaces AND a Go client — neither of which anyone
+// hand-writes. Change this file, regenerate, and the compiler tells you
+// everywhere that broke. Compare with REST, where a changed JSON field is
+// discovered at runtime by whoever gets the 500.
+
+syntax = "proto3";
+
+// The package namespaces messages on the wire and prevents collisions between
+// services. The `v1` is deliberate: a BREAKING change means publishing v2
+// alongside v1, not editing v1 — see the field-number rules below.
+package notification.v1;
+
+// Where the generated Go lands, and what the Go package is called.
+option go_package = "eventreg/gen/notification/v1;notificationv1";
+
+// ============================== THE SERVICE ================================
+//
+// `service` + `rpc` generate BOTH sides: a server interface for the notifier to
+// implement, and a client struct for the API to call. The method signature is
+// checked at COMPILE TIME on both ends — that's the "typed contract" the
+// checklist asks about, and the thing REST fundamentally cannot give you.
+service NotificationService {
+  // UNARY: one request, one response — the plain function-call shape, and 95%
+  // of real gRPC. The other three exist and are worth knowing:
+  //
+  //   server streaming  rpc Watch(Req) returns (stream Event)
+  //                     one request, many responses. Live feeds, tailing logs.
+  //   client streaming  rpc Upload(stream Chunk) returns (Summary)
+  //                     many requests, one response. File uploads, bulk ingest.
+  //   bidirectional     rpc Chat(stream Msg) returns (stream Msg)
+  //                     both directions at once, independently. Chat, gaming.
+  //
+  // All four ride on ONE HTTP/2 connection — streaming isn't a special
+  // transport, it's what HTTP/2 multiplexing already allows.
+  rpc SendNotification(SendNotificationRequest) returns (SendNotificationResponse);
+
+  // A trivial health RPC so the API can report whether notifications are up.
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// =========================== FIELD NUMBERS =================================
+//
+// THE MOST IMPORTANT RULE IN PROTOBUF, and a guaranteed interview question.
+//
+// The numbers (= 1, = 2 …) are what actually goes ON THE WIRE. Field NAMES are
+// not transmitted at all — that's why protobuf is so much smaller than JSON,
+// which repeats every key in every message.
+//
+// So the encoder writes "field 3 = 42" and the decoder looks up what field 3
+// means IN ITS OWN COPY of this file. If the two sides disagree about what
+// number 3 means, the data is silently misinterpreted — no error, just wrong
+// values. It is the single easiest way to corrupt a distributed system.
+//
+// Therefore, once a field number is deployed:
+//   - NEVER change it
+//   - NEVER reuse it for a different field
+//   - to remove a field, delete it and mark the number `reserved`
+//
+// Renaming a field is fine (names are local). Changing its NUMBER or its TYPE
+// is not.
+//
+//   reserved 4, 7;                 // numbers we retired; never reuse
+//   reserved "old_field_name";
+//
+// Note also 1-15 encode in ONE byte and 16+ take two, so the fields you send
+// most often belong in the low numbers.
+
+enum NotificationType {
+  // Proto3 REQUIRES a zero value, and it must mean "unset". Every proto3 field
+  // has a default and there's no way to distinguish "absent" from "zero" —
+  // so an explicit UNSPECIFIED is how you detect a caller that forgot to set
+  // it, rather than silently treating it as the first real enum value.
+  NOTIFICATION_TYPE_UNSPECIFIED = 0;
+  NOTIFICATION_TYPE_BOOKING_CONFIRMED = 1;
+  NOTIFICATION_TYPE_WAITLISTED = 2;
+  // The interesting one — this is the event from lesson 12 that genuinely
+  // needs a notification: someone cancelled, and you just got their seat.
+  // The user isn't looking at the page; if we don't tell them, they'll never
+  // know.
+  NOTIFICATION_TYPE_PROMOTED_FROM_WAITLIST = 3;
+}
+
+message SendNotificationRequest {
+  int64 user_id = 1;
+  string email = 2;
+  NotificationType type = 3;
+  int64 event_id = 4;
+  string event_name = 5;
+  int32 seats = 6;
+
+  // IDEMPOTENCY KEY. gRPC clients retry on transient failures, and a retried
+  // "you're in!" email is a bad experience. The notifier de-duplicates on this
+  // key — the same discipline as UNIQUE(event_id,user_id) in lesson 11, applied
+  // across a network boundary instead of inside a database.
+  string idempotency_key = 7;
+}
+
+message SendNotificationResponse {
+  string notification_id = 1;
+  bool delivered = 2;
+  // True when this exact notification was already sent and we skipped it.
+  bool deduplicated = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  int64 sent_count = 2;
+}

@@ -1,0 +1,18 @@
+# buf configuration.
+#
+# WHY buf INSTEAD OF protoc:
+# protoc is a C++ binary you download and put on PATH — fine on Linux CI,
+# genuinely annoying on Windows. buf is a single Go binary (`go install`) with
+# a protobuf compiler BUILT IN, so there's no protoc to manage at all. It also
+# adds linting and breaking-change detection, which protoc has never had.
+#
+# The generated Go is identical either way — buf drives the same
+# protoc-gen-go / protoc-gen-go-grpc plugins. The equivalent protoc invocation
+# is documented in the lesson explanation for completeness.
+version: v1
+breaking:
+  use:
+    - FILE
+lint:
+  use:
+    - DEFAULT

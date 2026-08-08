@@ -80,11 +80,27 @@ services:
       retries: 10
 
   # ------------------------------------------------------------------ api --
-  api:
+  #
+  # TWO REPLICAS (lesson 19). api1 and api2 are IDENTICAL — same image, same
+  # config, no shared memory. Nginx round-robins between them.
+  #
+  # WHY TWO NAMED SERVICES rather than `docker compose up --scale api=2`:
+  # scaling gives all replicas the same DNS name, and nginx resolves an
+  # `upstream server` entry ONCE at startup — so it would only ever see the
+  # first IP and quietly send everything to one replica. Naming them explicitly
+  # makes the upstream block real, and makes it obvious in logs which replica
+  # served a request. (The `--scale` approach needs a `resolver` directive and
+  # a variable in proxy_pass to force per-request DNS lookups.)
+  #
+  # NOTE: neither replica publishes a host port any more. They are reachable
+  # ONLY through nginx, which is the point of a reverse proxy — one entry point,
+  # backends invisible from outside.
+  api1: &api-defaults
     build:
       context: .          # send this directory as the build context
       dockerfile: Dockerfile
-    environment:
+    image: eventreg-api:local   # shared tag so the image is built once
+    environment: &api-env
       # ---- THE NETWORKING LESSON ----
       # The host is `postgres` — the SERVICE NAME, not localhost, not an IP.
       #
@@ -109,6 +125,23 @@ services:
       REDIS_URL: redis://redis:6379/0
       CACHE_TTL: 30s
 
+      # DELIBERATELY HIGH FOR LOCAL LOAD TESTING.
+      #
+      # A lesson learned the hard way: cmd/loadtest fires hundreds of requests
+      # from ONE IP, so with the production-ish default (100/min) the limiter
+      # correctly 429s your own test and you "discover" a bug that is actually
+      # your defences working. Every load test must account for the rate limiter
+      # — either raise it, or spread the load across source IPs.
+      #
+      # Production would use something like 100/1m here.
+      RATE_LIMIT_REQUESTS: "100000"
+      AUTH_RATE_LIMIT_REQUESTS: "100000"
+
+      # gRPC target for the notification service — service-name DNS again.
+      # Unset this and the API runs perfectly well with notifications disabled.
+      NOTIFIER_ADDR: notifier:50051
+      NOTIFIER_TIMEOUT: 2s
+
       # Everything below is lesson 14's config layer paying off: the image is
       # identical in every environment, and only these values change.
       APP_ENV: development
@@ -121,10 +154,16 @@ services:
       # manager — never committed. Compose reads a sibling .env automatically,
       # so in a real setup this line would be:
       #     JWT_SECRET: ${JWT_SECRET}
+      # ALL REPLICAS SHARE THE SAME SECRET. This is what makes JWTs work behind
+      # a load balancer: a token minted by api1 must verify on api2. If each
+      # replica generated its own secret, every other request would 401.
       JWT_SECRET: local-dev-secret-at-least-32-characters-long
 
-    ports:
-      - "8082:8082"
+      # Tells the app to trust X-Forwarded-For / X-Real-IP. ONLY safe because
+      # nginx is the sole entry point and always overwrites them. Set this
+      # without a proxy in front and any client can forge its IP to dodge the
+      # rate limiter. See internal/config.
+      TRUST_PROXY: "true"
 
     depends_on:
       postgres:
@@ -141,6 +180,65 @@ services:
 
     # Restart if the process exits unexpectedly, but NOT if we deliberately
     # stopped it. Handy while developing; in Kubernetes the scheduler owns this.
+    restart: unless-stopped
+
+  # The second replica. `<<: *api-defaults` is a YAML MERGE KEY — it splices in
+  # everything anchored as &api-defaults above, so the two replicas cannot drift
+  # apart. Copy-pasting the block would guarantee they eventually do.
+  api2:
+    <<: *api-defaults
+
+  # ------------------------------------------------------------- notifier --
+  #
+  # The second SERVICE (lesson 20) — a separate process the API calls over
+  # gRPC. Same image as the API (one Dockerfile, two binaries in cmd/), just a
+  # different entrypoint.
+  #
+  # No host port published: nothing outside the network should speak to it, and
+  # it isn't an HTTP service you'd curl anyway.
+  notifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: eventreg-api:local
+    # Override the image's ENTRYPOINT to run the other binary. This is why the
+    # Dockerfile builds ./cmd/api by default but the source for both is present.
+    entrypoint: ["/app/notifier"]
+    environment:
+      APP_ENV: development
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+      GRPC_PORT: "50051"
+      SHUTDOWN_TIMEOUT: 15s
+      JWT_SECRET: local-dev-secret-at-least-32-characters-long
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- nginx --
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      # THE ONLY PUBLISHED PORT IN THE STACK now (besides the databases, which
+      # are exposed purely for local debugging). Everything enters here.
+      - "8080:80"
+    volumes:
+      # :ro — mount the config READ-ONLY. Nginx never needs to write it, and a
+      # compromised container shouldn't be able to rewrite its own routing.
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api1
+      - api2
+    # Plain depends_on is fine here: nginx starts happily with dead backends
+    # and simply returns 502 until they answer. It doesn't need them READY the
+    # way the API needs Postgres ready.
+    healthcheck:
+      # 127.0.0.1, NOT localhost. Inside alpine, `localhost` can resolve to ::1
+      # first, and `listen 80;` binds IPv4 only — so the probe got "connection
+      # refused" while the server was serving perfectly. A confusing way to mark
+      # a healthy container unhealthy.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/nginx-health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped
 
 volumes:
