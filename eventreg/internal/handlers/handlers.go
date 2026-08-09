@@ -132,6 +132,7 @@ func (h *EventHandler) Register(e *echo.Echo, protect echo.MiddlewareFunc) {
 
 	// --- public ---
 	e.GET("/health", h.health)
+	e.GET("/ready", h.ready)
 	e.GET("/events", h.listEvents)
 	// NOTE: /events/stats must be registered BEFORE /events/:id would be a
 	// concern in some routers, because "stats" could match the :id pattern.
@@ -249,6 +250,42 @@ func (h *EventHandler) releaseHold(c echo.Context) error {
 //	@Router			/health [get]
 func (h *EventHandler) health(c echo.Context) error {
 	return c.String(http.StatusOK, "ok")
+}
+
+//	@Summary		Readiness check
+//	@Description	Reports whether this instance can SERVE TRAFFIC — i.e. its dependencies
+//	@Description	are reachable. Returns 503 when the database is unavailable.
+//	@Tags			meta
+//	@Produce		json
+//	@Success		200	{object}	map[string]string
+//	@Failure		503	{object}	handlers.ErrorResponse
+//	@Router			/ready [get]
+//
+// ============== LIVENESS vs READINESS (the interview distinction) ==========
+//
+//	/health  LIVENESS  — "is this process alive?"  Failing it gets the pod
+//	                     KILLED AND RESTARTED. So it must check almost nothing:
+//	                     if it checked the database, a brief DB outage would
+//	                     restart every pod in the fleet, which fixes nothing and
+//	                     turns a small problem into an outage.
+//
+//	/ready   READINESS — "can this pod serve traffic RIGHT NOW?" Failing it
+//	                     removes the pod from the Service's endpoints — no
+//	                     restart, just no traffic. It recovers by itself when
+//	                     the dependency returns.
+//
+// The rule: LIVENESS should check only the process itself; READINESS checks
+// the dependencies you need to answer a request. Getting this backwards —
+// checking the DB in liveness — is one of the most common Kubernetes mistakes,
+// and it converts a degraded dependency into a crash-loop.
+func (h *EventHandler) ready(c echo.Context) error {
+	// A real dependency check: the cheapest query that proves the database is
+	// answering. If this fails we are up but useless, which is exactly the
+	// state readiness exists to describe.
+	if _, err := h.Store.List(1, 0); err != nil {
+		return c.JSON(http.StatusServiceUnavailable, ErrorResponse{Error: "storage unavailable"})
+	}
+	return c.JSON(http.StatusOK, map[string]string{"status": "ready"})
 }
 
 // listEvents supports ?limit= and ?offset= — e.g. /events?limit=10&offset=20.

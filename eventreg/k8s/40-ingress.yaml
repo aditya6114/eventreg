@@ -1,0 +1,54 @@
+# Ingress — the last link in the chain, and nginx's job from lesson 19 turned
+# into a declaration.
+#
+# ==================== WHY INGRESS EXISTS (interview) ======================
+#
+# You could expose the API with `type: LoadBalancer`. But a cloud LoadBalancer
+# is a real provisioned resource with a real bill, and you'd need ONE PER
+# SERVICE. Ten public services = ten load balancers = ten public IPs = ten
+# certificates to manage.
+#
+# Ingress inverts that: ONE load balancer / entry point, and rules that route
+# by HOST and PATH to many Services. It's a shared front door.
+#
+# THE PART PEOPLE MISS: an Ingress OBJECT does nothing by itself. It's just a
+# routing table sitting in the API server. You also need an INGRESS CONTROLLER
+# — a real proxy that watches Ingress objects and reconfigures itself.
+#
+# And the most common controller is... nginx. So this is nginx again, exactly
+# as in lesson 19 — but instead of you writing nginx.conf, the controller
+# generates it from these rules and reloads on change. Same proxy, declarative
+# interface, and it updates automatically as pods come and go.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: eventreg
+  namespace: eventreg
+  annotations:
+    # Annotations are how you reach controller-specific features the portable
+    # Ingress spec doesn't cover — proxy timeouts, body size, rewrites. The
+    # price of that power is portability: these are nginx-controller-specific
+    # and mean nothing to Traefik or an AWS ALB controller.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api      # -> Service `api` -> pods labelled app=api
+                port:
+                  number: 80
+# TLS would go here in production — and note it's DECLARED, not configured:
+#
+#   tls:
+#     - hosts: [eventreg.example.com]
+#       secretName: eventreg-tls
+#
+# The controller reads the certificate from that Secret and terminates TLS.
+# With cert-manager it's issued and renewed automatically — the operational
+# win over hand-managing certs in an nginx.conf.

@@ -1,0 +1,174 @@
+# The API: Deployment (2 replicas) + Service.
+#
+# ==================== THE OBJECT CHAIN (interview) =========================
+#
+#   Pod         the smallest deployable unit: one or more containers sharing a
+#               network namespace and lifecycle. EPHEMERAL — it gets a new IP
+#               every time it's recreated, so you never address a Pod directly.
+#
+#   Deployment  declares "I want N pods of this template". It creates a
+#               ReplicaSet, which creates Pods, and it owns ROLLOUT strategy
+#               (how to replace pods when the template changes).
+#
+#   Service     a stable virtual IP + DNS name in front of a CHANGING set of
+#               pods, chosen by LABEL SELECTOR. This is what solves the
+#               "pods have ephemeral IPs" problem.
+#
+#   Ingress     HTTP routing from outside the cluster to Services — host/path
+#               rules, TLS. This is nginx's job from lesson 19, now declared
+#               instead of configured.
+#
+# The chain: Ingress -> Service -> Pod (managed by Deployment via ReplicaSet).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: eventreg
+spec:
+  type: ClusterIP        # the Ingress reaches it; the outside world doesn't
+  selector:
+    # ================= LABELS ARE THE WIRING ==========================
+    # A Service does NOT reference a Deployment. It selects PODS BY LABEL.
+    # That indirection is deliberate and powerful: it's how blue/green and
+    # canary deploys work — point the selector at a different label and
+    # traffic moves, with no change to either Deployment.
+    #
+    # It also means a typo in a label silently sends traffic nowhere. If a
+    # Service has no endpoints, check the labels first:
+    #   kubectl get endpoints api -n eventreg
+    app: api
+  ports:
+    - port: 80           # the port the Service exposes
+      targetPort: 8082   # the port on the pod
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: eventreg
+spec:
+  replicas: 2            # the same two replicas as lesson 19, now declarative:
+                         # this is DESIRED STATE, not an instruction. Kill one
+                         # and the controller creates a replacement.
+  selector:
+    matchLabels:
+      app: api
+  strategy:
+    # ================= ROLLING UPDATE (interview) =====================
+    # The default strategy, and the reason zero-downtime deploys are free.
+    #
+    #   maxSurge        how many EXTRA pods may exist during the rollout
+    #   maxUnavailable  how many may be missing
+    #
+    # maxUnavailable: 0 means capacity NEVER drops below `replicas` — a new
+    # pod must become READY before an old one is removed. That's the setting
+    # that makes the rollout genuinely zero-downtime, and it depends entirely
+    # on the readiness probe being honest.
+    #
+    # The alternative, `Recreate`, kills everything then starts the new
+    # version — brief total downtime. Correct only when two versions cannot
+    # coexist (e.g. an incompatible schema migration).
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: api          # MUST match the Service selector above
+    spec:
+      containers:
+        - name: api
+          image: eventreg-api:local
+          # IfNotPresent: use the local image and don't try to pull from a
+          # registry. Essential with `kind load docker-image`; the default
+          # (Always for :latest) would fail with ImagePullBackOff since this
+          # image exists only on your machine.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8082
+          envFrom:
+            # Pull EVERY key from the ConfigMap and Secret as env vars, rather
+            # than listing them one by one. The app reads config from the
+            # environment (lesson 14), so this is the whole integration.
+            - configMapRef:
+                name: api-config
+            - secretRef:
+                name: api-secrets
+
+          # ============== LIVENESS vs READINESS (interview) ==============
+          #
+          # This is the pair the checklist calls out, and the distinction that
+          # matters most in practice:
+          livenessProbe:
+            # "Is the process alive?" FAILING THIS RESTARTS THE POD.
+            # So it checks almost nothing — /health just returns "ok".
+            #
+            # If liveness checked the database, a brief DB blip would restart
+            # every pod in the fleet simultaneously. That fixes nothing (the DB
+            # is still down), throws away in-flight requests, and turns a
+            # degraded dependency into a crash-loop. A classic self-inflicted
+            # outage.
+            httpGet:
+              path: /health
+              port: 8082
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            # "Can this pod serve traffic RIGHT NOW?" FAILING THIS ONLY REMOVES
+            # IT FROM THE SERVICE — no restart. /ready checks the database.
+            #
+            # This is also what gates the rolling update: a new pod receives no
+            # traffic until it's ready, and with maxUnavailable: 0 the old pod
+            # isn't removed until then.
+            httpGet:
+              path: /ready
+              port: 8082
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 2
+
+          startupProbe:
+            # The third, less famous one — and it solves a real conflict.
+            # Migrations run at boot, so startup can be slow. Without this
+            # you'd need a long initialDelaySeconds on liveness, which then
+            # makes liveness slow to notice a REAL hang later.
+            #
+            # startupProbe disables the other two until it passes: generous at
+            # boot (30 x 2s = up to 60s), strict afterwards. Best of both.
+            httpGet:
+              path: /health
+              port: 8082
+            failureThreshold: 30
+            periodSeconds: 2
+
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+
+          lifecycle:
+            preStop:
+              # A SUBTLE BUT REAL RACE. When a pod is deleted, two things happen
+              # CONCURRENTLY: SIGTERM is sent, and the pod is removed from
+              # Service endpoints. Endpoint removal propagates through kube-proxy
+              # on every node, which takes a moment — so traffic can still arrive
+              # for a short window AFTER SIGTERM.
+              #
+              # This sleep delays SIGTERM slightly, letting endpoint removal win
+              # the race. Without it you get occasional connection-refused errors
+              # during every rollout — intermittent, hard to reproduce, and
+              # invariably blamed on something else.
+              exec:
+                command: ["sleep", "3"]
+
+      # terminationGracePeriod must exceed preStop + the app's own
+      # SHUTDOWN_TIMEOUT (15s), or the kubelet SIGKILLs mid-drain and lesson
+      # 14's graceful shutdown never gets to finish.
+      terminationGracePeriodSeconds: 30

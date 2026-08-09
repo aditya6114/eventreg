@@ -1,0 +1,81 @@
+# ============================================================================
+# WHAT KUBERNETES SOLVES THAT DOCKER-COMPOSE DOESN'T  (interview)
+#
+# compose is a great local tool. It falls down the moment you need production:
+#
+#   compose                          kubernetes
+#   ------------------------------   -----------------------------------------
+#   one machine                      a cluster; the scheduler places pods
+#   restart: unless-stopped          self-healing against a DESIRED STATE
+#   `up --scale`, manual             declarative replicas, autoscaling
+#   recreate = downtime              rolling updates with zero downtime
+#   no readiness concept             probes gate traffic per pod
+#   env vars in the file             ConfigMaps + Secrets, versioned separately
+#   you notice failures              the control loop notices and acts
+#
+# THE CORE IDEA — and the thing to actually say in an interview:
+# compose is IMPERATIVE ("start these containers"). Kubernetes is DECLARATIVE
+# ("this is the desired state") and runs a CONTROL LOOP that continuously makes
+# reality match. Kill a pod and one reappears — not because something watched
+# your command, but because the observed state stopped matching the declared
+# state and the controller corrected it.
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eventreg
+---
+# ============================ ConfigMap ====================================
+# NON-SENSITIVE configuration, separated from the image.
+#
+# WHY THIS EXISTS: the same image must run in dev/staging/prod. Baking config
+# into the image would mean rebuilding per environment — and then the artifact
+# you tested is not the artifact you shipped. This is lesson 14's 12-factor
+# config, now expressed as a first-class cluster object.
+#
+# Changing a ConfigMap does NOT restart pods automatically. Env vars are read
+# once at process start, so you must trigger a rollout:
+#   kubectl rollout restart deployment/api -n eventreg
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+  namespace: eventreg
+data:
+  APP_ENV: "development"
+  PORT: "8082"
+  LOG_FORMAT: "json"
+  LOG_LEVEL: "info"
+  SHUTDOWN_TIMEOUT: "15s"
+  CACHE_TTL: "30s"
+  HOLD_TTL: "5m"
+  TRUST_PROXY: "true"          # Ingress terminates and sets X-Forwarded-For
+  NOTIFIER_ADDR: "notifier:50051"
+  NOTIFIER_TIMEOUT: "2s"
+  # Service DNS: <service>.<namespace>.svc.cluster.local — but inside the same
+  # namespace the short name is enough. Same idea as compose service names,
+  # now backed by cluster DNS.
+  DATABASE_URL: "postgres://eventgo:secret@postgres:5432/eventgo?sslmode=disable"
+  REDIS_URL: "redis://redis:6379/0"
+  RATE_LIMIT_REQUESTS: "100000"       # high for load testing; see lesson 19
+  AUTH_RATE_LIMIT_REQUESTS: "100000"
+---
+# ============================== Secret =====================================
+# SENSITIVE configuration. Separate object because it's handled differently:
+# RBAC can restrict who reads Secrets, they can be encrypted at rest, and they
+# aren't printed in `kubectl describe`.
+#
+# ⚠️ BE HONEST ABOUT WHAT THIS IS NOT: `stringData` here is stored base64 in
+# etcd, and base64 is ENCODING, NOT ENCRYPTION. Anyone with cluster read access
+# can decode it, and this file is in git. A real deployment uses Sealed
+# Secrets, External Secrets, or a cloud secret manager. Knowing that Secrets
+# are "not very secret by default" is itself the interview answer.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: api-secrets
+  namespace: eventreg
+type: Opaque
+stringData:   # stringData takes plain text; kubernetes base64-encodes it for you
+  JWT_SECRET: "local-dev-secret-at-least-32-characters-long"
+  POSTGRES_PASSWORD: "secret"

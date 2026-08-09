@@ -1,0 +1,77 @@
+# The notification service (gRPC), from lesson 20.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notifier
+  namespace: eventreg
+spec:
+  type: ClusterIP     # internal only — nothing outside should speak gRPC to it
+  selector:
+    app: notifier
+  ports:
+    - port: 50051
+      targetPort: 50051
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notifier
+  namespace: eventreg
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notifier
+  template:
+    metadata:
+      labels:
+        app: notifier
+    spec:
+      containers:
+        - name: notifier
+          image: eventreg-api:local     # same image, different entrypoint
+          imagePullPolicy: IfNotPresent
+          command: ["/app/notifier"]    # overrides the image ENTRYPOINT
+          env:
+            - name: APP_ENV
+              value: "development"
+            - name: LOG_FORMAT
+              value: "json"
+            - name: GRPC_PORT
+              value: "50051"
+          envFrom:
+            - secretRef:
+                name: api-secrets       # config.Load() requires JWT_SECRET
+          ports:
+            - containerPort: 50051
+          # NO HTTP PROBES HERE — this is a gRPC server; there is no HTTP
+          # endpoint for httpGet to hit.
+          #
+          # Three options, worth knowing:
+          #   1. tcpSocket (below) — crude: proves something is LISTENING, not
+          #      that gRPC is healthy. Adequate for this project.
+          #   2. grpc: {port: 50051} — native gRPC probes (k8s 1.24+), which
+          #      requires implementing the standard grpc.health.v1 service.
+          #   3. grpc_health_probe as an exec probe — the pre-1.24 approach.
+          #
+          # Choosing tcpSocket deliberately, and knowing why it's weak, beats
+          # using it without noticing.
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+      terminationGracePeriodSeconds: 30
