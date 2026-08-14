@@ -1,0 +1,32 @@
+# Override that runs the API with Redis DISABLED, for A/B measurement.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.nocache.yml up -d api1 api2
+#   ... run the benchmark ...
+#   docker compose up -d api1 api2        # restore the normal stack
+#
+# An empty REDIS_URL makes the app skip the cache decorator entirely and read
+# straight from Postgres. That it STILL WORKS is the design point — a cache is
+# an optimization, never a dependency — and it's what makes the comparison in
+# loadtest/k6/RESULTS.md possible at all.
+#
+# Note this also disables rate limiting and seat holds, which share the Redis
+# connection. Fine for a read-path benchmark; not a configuration to ship.
+services:
+  api1: &nocache
+    environment:
+      REDIS_URL: ""
+      DATABASE_URL: postgres://eventgo:secret@postgres:5432/eventgo?sslmode=disable
+      JWT_SECRET: local-dev-secret-at-least-32-characters-long
+      APP_ENV: development
+      PORT: "8082"
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+      TRUST_PROXY: "true"
+      NOTIFIER_ADDR: notifier:50051
+      NOTIFIER_TIMEOUT: 2s
+      RATE_LIMIT_REQUESTS: "100000"
+      AUTH_RATE_LIMIT_REQUESTS: "100000"
+      SHUTDOWN_TIMEOUT: 15s
+
+  api2:
+    <<: *nocache
