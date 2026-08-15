@@ -1,0 +1,22 @@
+# Overlay that reduces the app tier to ONE replica, for the load-test A/B.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.single.yml up -d
+#   ...run the tests...
+#   docker compose up -d --force-recreate nginx api2     # restore two replicas
+#
+# Two changes, and both are needed:
+#   1. nginx gets the single-backend config, so it never tries api2 and never
+#      pays failover cost pretending to be a 1-replica measurement.
+#   2. api2 is scaled to zero, so the second replica isn't quietly still there
+#      competing for the same laptop CPU as api1 and skewing the comparison.
+
+services:
+  nginx:
+    volumes:
+      - ./nginx/nginx-single.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api1
+
+  api2:
+    deploy:
+      replicas: 0

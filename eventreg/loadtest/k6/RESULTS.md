@@ -1,6 +1,8 @@
 # Load test results
 
-Recorded **2026-08-12**. These are the numbers behind the claims in the root README.
+Sections 1–3 recorded **2026-08-12**; section 4 (the fixed-request-count matrix and the
+replica A/B) recorded **2026-08-15**. These are the numbers behind the claims in the root
+README.
 
 **Test bench (state this whenever you quote a figure):** the whole stack —
 Nginx, 2 API replicas, Postgres, Redis, notifier — plus the k6 container, all on
@@ -138,6 +140,104 @@ limiter costs more than the cache saves. That is not a bug and not a reason to r
 
 ---
 
+## 4. Fixed-request-count matrix, and replicas vs no replicas
+
+Recorded **2026-08-15** with `matrix.js`. Closed model (`shared-iterations`), 50 VUs
+held constant across every row, against `GET /events`. Rate limiter lifted via
+`docker-compose.loadtest.yml` — see the note at the end of this section for why that is
+necessary rather than a fudge.
+
+### 4a. Page size sweep — 10,000 requests per row
+
+| Page size | Replicas | Time | Throughput | p95 | p99 | Errors |
+|---|---|---|---|---|---|---|
+| `limit=10` | 2 | 2.44 s | 4,154 req/s | 15.68 ms | 26.38 ms | 0 |
+| `limit=20` | 2 | 2.08 s | 4,858 req/s | 12.81 ms | 16.19 ms | 0 |
+| `limit=50` | 2 | 2.50 s | 4,052 req/s | 16.69 ms | 22.45 ms | 0 |
+| `limit=100` | 2 | 2.63 s | 3,847 req/s | 18.40 ms | 25.14 ms | 0 |
+| `limit=10` | 1 | 2.65 s | 3,819 req/s | 20.97 ms | 34.11 ms | 0 |
+| `limit=20` | 1 | 2.03 s | 4,993 req/s | 12.08 ms | 16.24 ms | 0 |
+| `limit=50` | 1 | 2.37 s | 4,271 req/s | 14.35 ms | 19.02 ms | 0 |
+| `limit=100` | 1 | 2.55 s | 3,964 req/s | 18.92 ms | 25.46 ms | 0 |
+
+Cost grows roughly linearly with page size from `limit=20` up: 20 → 100 is about **+44 %
+p95** for 5× the rows.
+
+**The `limit=10` rows are warm-up, not a finding.** Less data cannot cost more; that row
+was simply first in each batch and paid for cold connection pools, an empty cache, and
+the Go runtime settling. The defensible trend is 20 → 50 → 100.
+
+**`limit=500` and `limit=1000` are not measurable** — `models.MaxLimit` clamps `limit` to
+100 by design, so both would silently return 100 rows and the "tier" would be a
+relabelled duplicate. The clamp is the DoS guard that makes `?limit=10000000` harmless.
+
+### 4b. Request volume, 2 replicas vs 1 — `limit=20`
+
+| Requests | Replicas | Time | Throughput | p95 | p99 | Errors |
+|---|---|---|---|---|---|---|
+| 1,000 | 2 | 0.67 s | 1,675 req/s | 13.08 ms | 16.46 ms | 0 |
+| 1,000 | 1 | 0.62 s | 1,806 req/s | 10.81 ms | 13.69 ms | 0 |
+| 10,000 | 2 | 2.24 s | 4,513 req/s | 14.73 ms | 21.04 ms | 0 |
+| 10,000 | 1 | 2.11 s | 4,792 req/s | 13.33 ms | 18.14 ms | 0 |
+| 100,000 | 2 | 17.10 s | 5,855 req/s | 13.85 ms | 19.19 ms | 0 |
+| 100,000 | 1 | 16.00 s | 6,258 req/s | 13.09 ms | 17.75 ms | 0 |
+
+Repeat of the headline tier, because a surprising result deserves a second run:
+
+| Requests | Replicas | Run 1 | Run 2 |
+|---|---|---|---|
+| 100,000 | 2 | 17.10 s · 5,855 req/s · p95 13.85 ms | 17.21 s · 5,819 req/s · p95 14.08 ms |
+| 100,000 | 1 | 16.00 s · 6,258 req/s · p95 13.09 ms | 16.71 s · 5,992 req/s · p95 13.72 ms |
+
+### 4c. One replica beat two, on every tier
+
+Consistent across both repeats, so this is not noise. It is also not a bug.
+
+"2 replicas" on one laptop means two processes sharing the same cores. The second replica
+adds **no CPU**. What it does add is another process competing for those cores, per-request
+load-balancing work in Nginx, and a second connection pool against the same Postgres and
+Redis. Net cost: about **5 % throughput**.
+
+The case for two replicas was never throughput:
+
+1. **Availability** — kill one, the site stays up. Worth far more than 5 %.
+2. **Zero-downtime deploys** — `maxUnavailable: 0` rolls a new version out behind the old.
+3. **It proves statelessness** — round-robin only works if any replica can serve any
+   request. A token minted by `api1` verifies on `api2`; rate-limit counters live in Redis
+   so a limit of 10 stays 10.
+
+Horizontal scaling pays when replicas land on **different machines**. On one box it is an
+insurance premium, and this is what the premium costs.
+
+### 4d. The rate limiter blocked the first attempt
+
+The first 100,000-request run returned **52 % failures**. Nothing was broken: the limit is
+100,000/min per IP, the run fired 100,000 requests in ~15 s from one IP, and the limiter
+worked exactly as designed.
+
+This is the standard load-testing own-goal — the test looks like a single abusive client,
+your own defences block it, and you "find" a bug that is a feature. Real traffic at that
+rate arrives from tens of thousands of distinct IPs. `docker-compose.loadtest.yml` lifts
+the limit for measurement runs only, so the normal stack keeps its defences.
+
+### 4e. Caveats
+
+- Most cells are one run. Treat sub-millisecond differences as noise. The two claims that
+  were repeated (100k volume, 1 vs 2 replicas) held.
+- The events table grew through the session (each run seeds 120 events; it finished at
+  ~3,000 rows), so `COUNT(*)` in the list query got slightly more expensive as the sweep
+  went on. That works against later rows, not for them.
+- Same single-laptop caveat as every other section: the load generator competes with the
+  servers for CPU.
+
+### 4f. Launch burst re-verified the same day
+
+`launch-burst.js` was re-run on this build: **100 booked / 900 waitlisted / 0 conflicts /
+seats remaining 0 / 2,000 of 2,000 checks passed**, burst window 3.7 s, p95 3.45 s,
+p99 3.46 s — i.e. ~3.5 ms of lock-held work per booking, unchanged.
+
+---
+
 ## Reproducing
 
 ```bash
@@ -158,6 +258,20 @@ docker run --rm --network eventreg_default -e BASE_URL=http://nginx:80 \
 #    Redis disabled, restoring the stack afterwards
 docker compose -f docker-compose.yml -f docker-compose.nocache.yml up -d api1 api2
 docker compose up -d api1 api2
+
+# 4. the fixed-request-count matrix (section 4). Lift the rate limiter first,
+#    or a 100k run trips it and reports 52% "failures" that are really 429s.
+docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d api1 api2
+docker run --rm --network eventreg_default -e BASE_URL=http://nginx:80 \
+  -e REQUESTS=100000 -e VUS=50 -e LIMIT=20 \
+  -v "$PWD/loadtest/k6:/scripts:ro" grafana/k6 run /scripts/matrix.js
+
+# 4b. same again with ONE replica, then restore two
+docker compose -f docker-compose.yml -f docker-compose.loadtest.yml \
+  -f docker-compose.single.yml up -d nginx api1
+docker compose stop api2
+# ...rerun matrix.js...
+docker compose up -d --force-recreate nginx api1 api2
 ```
 
 Correctness is enforced by k6 **thresholds**, so `launch-burst.js` exits non-zero if the

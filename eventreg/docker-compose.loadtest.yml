@@ -1,0 +1,44 @@
+# Overlay that lifts the rate limiter out of the way for measurement runs.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d
+#
+# WHY THIS IS NECESSARY, and why it is a lesson rather than a fudge:
+#
+# The base compose file already raises the limit to 100,000/min for local
+# testing. A 100,000-request run finishes in ~15 seconds — comfortably inside
+# ONE fixed window — so it lands right on that ceiling, and back-to-back runs
+# share the same per-minute bucket. The first run of the day passes; the fourth
+# gets 429s and looks like the server "broke" under load.
+#
+# That is the rate limiter WORKING, not a bug, and mistaking one for the other
+# is the classic load-testing own-goal: every request comes from one source IP,
+# so the whole test looks like a single abusive client. Real traffic at 100k/min
+# arrives from tens of thousands of distinct IPs and would never touch this.
+#
+# The honest options are (a) raise the limit, (b) spread load across source IPs,
+# or (c) key the limiter on something other than IP. This file is (a), scoped to
+# measurement runs so the normal stack keeps its defences.
+services:
+  api1: &loadtest-env
+    environment:
+      DATABASE_URL: postgres://eventgo:secret@postgres:5432/eventgo?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      CACHE_TTL: 30s
+      # Effectively unlimited FOR THE DURATION OF A MEASUREMENT RUN ONLY.
+      RATE_LIMIT_REQUESTS: "100000000"
+      AUTH_RATE_LIMIT_REQUESTS: "100000000"
+      NOTIFIER_ADDR: notifier:50051
+      NOTIFIER_TIMEOUT: 2s
+      APP_ENV: development
+      PORT: "8082"
+      LOG_FORMAT: json
+      # warn, not info: at ~7,000 req/s an access log line per request is real
+      # CPU and real disk I/O on the same laptop that is hosting the load
+      # generator. Logging noise would be measured as latency.
+      LOG_LEVEL: warn
+      SHUTDOWN_TIMEOUT: 15s
+      JWT_SECRET: local-dev-secret-at-least-32-characters-long
+      TRUST_PROXY: "true"
+
+  api2:
+    <<: *loadtest-env
